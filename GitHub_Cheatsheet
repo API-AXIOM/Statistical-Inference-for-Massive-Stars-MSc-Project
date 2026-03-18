@@ -1,0 +1,6 @@
+go to the directory: /Users/hulya/Desktop/Alles/UvA/MSc_project/Anja_NN/Statistical-Inference-for-Massive-Stars-MSc-Project/
+git init
+git status
+git add whatever_file
+git commit -m "Your commit message"
+git push origin main (or experimental-branch or anything else)
