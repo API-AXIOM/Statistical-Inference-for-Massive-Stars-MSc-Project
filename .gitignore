@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# Editor/IDE
+.vscode/
+__pycache__/
+
+# Archives / large files
+*.zip
+*.tar
+*.tar.gz
+
+# Local data / heavy outputs (adjust as needed)
+FASTWIND_spectra/
+MCMC_results/
+emulators_per_line_hg/
+nested_sampling_results/
+ns_results_vasilis_hg_spectrum_only_smoke/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
