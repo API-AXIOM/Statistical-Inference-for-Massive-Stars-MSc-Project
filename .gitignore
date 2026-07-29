@@ -19,3 +19,15 @@ ns_results_vasilis_hg_spectrum_only_smoke/
 
 # Jupyter checkpoints
 .ipynb_checkpoints/
+
+# Ignore Jupyter notebooks (keep only scripts in repo)
+*.ipynb
+
+# Ignore images and other heavy binary outputs
+*.png
+*.jpg
+*.jpeg
+
+# Ignore local/demo folders / heavy data
+KIWI-GA/
+Vasilisemulator*.ipynb
