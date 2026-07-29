@@ -1,29 +1,41 @@
 import sys
 import os
-import subprocess
 import keras
+from emulator_inference import emulate_hg_spectrum, merge_line_spectra
+try:
+    from emulator_inference import resolve_device
+except ImportError:
+    def resolve_device(device=None):
+        import torch
+        if device is None or str(device).lower() == "auto":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        resolved = torch.device(device)
+        if resolved.type == "cuda" and not torch.cuda.is_available():
+            print("Warning: CUDA was requested but torch.cuda.is_available() is False; using CPU.")
+            return torch.device("cpu")
+        return resolved
 import json
 import corner
 import emcee
+import ultranest
 import warnings
-import timeit
+import time
 import numpy as np
 import matplotlib.pyplot as plt
+import ultranest.plot as up
 import tensorflow as tf
 import pandas as pd
 import PyAstronomy.pyasl as pyasl
 import paths_NN as ppp
-import NN_wrapper_Hhe_split as fw
-from scipy.signal import convolve
+import ga_notebook_tools as gnt
 from scipy.signal import fftconvolve
-from scipy.stats import norm
 from scipy.interpolate import interp1d
-from scipy.special import erf
 from scipy.optimize import minimize
 from IPython.display import display, clear_output
 from astropy.io import fits
-from scipy import stats
 from scipy.stats import binom
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'KIWI-GA'))
+import NN_wrapper_Hhe_split as fw
 
 ####################################################
 ## Importing and preparing all the imporant files ##
@@ -87,15 +99,82 @@ for afilter in zp_values:
 
 
 # --- Parameter names (order must match theta vector throughout) ---
-PARAM_NAMES = ['teff', 'logg', 'radius', 'logmdot', 'yhe', 'vsini']
-PARAM_BOUNDS = np.array([
-    [29000, 52000],  # teff
+PARAM_NAMES_ANJA = ['teff', 'logg', 'radius', 'logmdot', 'yhe', 'vsini']
+PARAM_BOUNDS_ANJA = np.array([
+    [29000, 52000],  # teff in K
     [3.4,   4.3  ],  # logg
-    [6,     21   ],  # radius
+    [6,     21   ],  # radius in Rsun
     [-7.5,  -5.2 ],  # logmdot
     [0.08,  0.15 ],  # yhe
-    [50.0,  399.0],  # vsini
+    [0.0,   399.0],  # vsini in km/s
 ])
+
+# Fixed parameters for Vasilis' emulator (set to None to free them)
+VASILIS_FIXED = {
+    "vinf":  2274.4,   # fix v_inf
+    "vturb": 10.0,     # fix v_turb
+}
+VASILIS_EMULATOR_DIR = "emulators_per_line_hg"
+VASILIS_DEVICE = "auto"
+VASILIS_WAVELENGTHS_BY_LINE = None
+
+def set_vasilis_fixed(vinf, vturb=10.0):
+    """Set model-specific fixed parameters for the 6D Vasilis inference vector."""
+    VASILIS_FIXED["vinf"] = float(vinf)
+    VASILIS_FIXED["vturb"] = float(vturb)
+
+def set_vasilis_device(device="auto"):
+    """Set the device used by Vasilis' PyTorch per-line emulators."""
+    global VASILIS_DEVICE
+    VASILIS_DEVICE = str(resolve_device(device))
+    return VASILIS_DEVICE
+
+def set_vasilis_wavelengths_by_line(wavelengths_by_line=None):
+    """Set fixed per-line wavelength grids for Vasilis' emulator calls."""
+    global VASILIS_WAVELENGTHS_BY_LINE
+    if wavelengths_by_line is None:
+        VASILIS_WAVELENGTHS_BY_LINE = None
+    else:
+        VASILIS_WAVELENGTHS_BY_LINE = {
+            str(name): np.asarray(wavelengths, dtype=np.float32)
+            for name, wavelengths in wavelengths_by_line.items()
+        }
+    return VASILIS_WAVELENGTHS_BY_LINE
+
+PARAM_NAMES_VASILIS  = ['teff', 'logg', 'radius', 'logmdot', 'yhe', 'vsini']  # 6 free params
+PARAM_BOUNDS_VASILIS = np.array([
+    [29000, 52000],  #teff
+    [3.4,   4.3  ],  #logg
+    [6,     21   ],  #radius
+    [-7.5,  -5.2 ],  #logmdot
+    [0.08,  0.15 ],  #yhe
+    [0.0,   399.0],  #vsini
+])
+
+WALKER_SCALE = {
+    "anja":    np.array([500, 0.05, 1, 0.1, 0.005, 1]),
+    "vasilis": np.array([500, 0.05, 1, 0.1, 0.005, 1]),
+}
+
+GA_NAME_MAP = {
+    "teff"   : "teff",
+    "logg"   : "logg",
+    "radius" : None,
+    "logmdot": "mdot",
+    "mdot"   : "mdot",
+    "yhe"    : "yhe",
+    "vsini"  : "vrot",
+    "vinf"   : "vinf",
+    "vturb"  : "vturb",
+}
+
+# Active set — change this one line to switch emulator throughout
+ACTIVE_EMULATOR = "anja"   # "anja" or "vasilis"
+
+PARAM_NAMES  = PARAM_NAMES_ANJA  if ACTIVE_EMULATOR == "anja" else PARAM_NAMES_VASILIS
+PARAM_BOUNDS = PARAM_BOUNDS_ANJA if ACTIVE_EMULATOR == "anja" else PARAM_BOUNDS_VASILIS
+
+
 
 def clip_to_prior(theta):
     return np.clip(theta, PARAM_BOUNDS[:, 0], PARAM_BOUNDS[:, 1])
@@ -104,43 +183,11 @@ def clip_to_prior(theta):
 ########## Simulating bc nothing is real ###########
 ####################################################
 
-# --- flux ---
-
-def planck_wavelength(wave_angstrom, temp):
-    ''' Calculate the Planck function as function of temperature and wavelength (in Angstrom. Output is then also in Angstrom).
-    wave_angstrom: wavelength in Angstrom
-    temp: temperature in Kelvin
-    '''
-    wave = wave_angstrom * angstrom_to_cm
-    prefactor = 2.0 * hh * cc**2 / (wave**5)
-    exponent = (hh * cc / kk) / (wave * temp)
-    Blambda = prefactor * (1.0 / (np.exp(exponent)-1))
-    Blambda = Blambda * angstrom_to_cm  #Blambda from per cm to per angstrom
-    return Blambda
-
-def flux_to_magnitude(obsflux):
-    ''' Calculate magnitude from observed flux and zeropoint flux'''
-    magnitude = -2.5 * np.log10(obsflux / zpflux)
-    return magnitude
-
-def compute_obs_flux(teff, radius, Tfrac=0.9, d=_LMC_DISTANCE_RSUN):
-    ''' Calculate the observed flux in the K-band based on the given parameters.
-    teff: effective temperature (K)
-    radius: stellar radius (solar radii)
-    Tfrac: fraction of teff to use for the blackbody calculation (default 0.9 to account for line formation in cooler layers)
-    d: distance to the star (default 50 kpc in cm (distance to LMC), converted to solar radii)
-    '''
-    tBB = teff * Tfrac
-    F_lambda = np.pi * planck_wavelength(_KS_WAVE, tBB)
-    filtered_flux = np.trapz(_KS_TRANS * F_lambda, _KS_WAVE) / _KS_NORM
-    return (radius / d)**2 * filtered_flux
-
-
 # --- normalization ---
 
 def normalize_theta(theta):
-    mn = np.array([normalization[f'{n}_min'] for n in PARAM_NAMES])
-    mx = np.array([normalization[f'{n}_max'] for n in PARAM_NAMES])
+    mn = np.array([normalization[f'{n}_min'] for n in PARAM_NAMES[:5]])
+    mx = np.array([normalization[f'{n}_max'] for n in PARAM_NAMES[:5]])
     return (theta - mn) / (mx - mn)
 
 
@@ -410,37 +457,129 @@ def rotBroadJax(wvl, flux, vsini, vsini_max=399, epsilon=0.6, n_vel=None, oversa
     return jnp.interp(ln_wvl_j, ln_wvl_uni_j, flux_broad_uni)
 
 
+def apply_rotational_broadening(wl, flux, broadening_method, vsini, limbdark=0.6):
+    """Apply rotational broadening on one continuous wavelength segment."""
+    if vsini <= 0:
+        return flux
+
+    if broadening_method == 'rotBroad':
+        return pyasl.rotBroad(wl, flux, epsilon=limbdark, vsini=vsini)
+    if broadening_method == 'fastRotBroad':
+        return pyasl.fastRotBroad(wl, flux, epsilon=limbdark, vsini=vsini)
+    if broadening_method == 'vspace':
+        return vspace(wvl=wl, flux=flux, vsini=vsini, epsilon=limbdark)
+    if broadening_method == 'jax':
+        return np.asarray(rotBroadJax(wvl=wl, flux=flux, vsini=vsini, vsini_max=399, epsilon=limbdark))
+    raise ValueError(
+        "Unknown broadening_method. Choose 'rotBroad', 'fastRotBroad', 'vspace', or 'jax'."
+    )
+
 # --- Simulating the spectrum and adding noise ---
 
-def simulate_model_spectrum(theta, broadening_method, model=model, limbdark=0.6, output_wl=None):
-    ''' Simulate the model spectrum for given parameters, with optional rotational broadening and interpolation to an output wavelength grid.
-    theta: array of parameters [teff, logg, radius, logmdot, yhe]
-    broadening_method: methods to add rotational broadening (pyasl.rotBroad, pyasl.fastRotBroad, vspace or rotBroadJax)
-    model: keras model to predict the spectrum
-    vsini: projected rotational velocity (km/s) for rotational broadening (optional)
-    limbdark: limb darkening coefficient for rotational broadening (optional)
-    output_wl: wavelength grid to interpolate the final spectrum onto (optional; if None, returns on wl_uniform grid)
-    '''
-    theta_in_model=theta[:5]                                                                       # extract teff, logg, radius, logmdot, yhe
-    norm_params = normalize_theta(theta_in_model)                                                  # normalize the input parameters to the [0,1] range expected by the model
-    vsini=theta[5]                                                                                 # extract vsini
-    flux_master = model(norm_params[None, :], training=False).numpy().ravel() 
-    flux_master_ordered = flux_master[order]                                                       # reorder + deduplicate
-    flux_unique = flux_master_ordered[unique_idx]                                                  # flux_master is now on the master_wl_unique grid
-    flux_out = np.interp(wl_uniform,master_wl_unique,flux_unique)                                  # interpolate master → uniform grid
-    if vsini == 0:
-        flux_out = np.interp(output_wl,wl_uniform,flux_out) if output_wl is not None else flux_out # if no broadening, just interpolate to output grid if needed
-    elif vsini > 0:
-        if broadening_method == 'rotBroad':
-            flux_out = pyasl.rotBroad(wl_uniform, flux_out, epsilon=limbdark, vsini=vsini)
-        elif broadening_method == 'fastRotBroad':
-            flux_out = pyasl.fastRotBroad(wl_uniform, flux_out, epsilon=limbdark, vsini=vsini)
-        elif broadening_method == 'vspace':
-            flux_out = vspace(wvl=wl_uniform, flux=flux_out, vsini=vsini, epsilon=limbdark)
-        elif broadening_method == 'jax':
-            flux_out = rotBroadJax(wvl=wl_uniform, flux=flux_out, vsini=vsini, vsini_max=399, epsilon=limbdark)
-        if output_wl is not None:
-            flux_out=np.interp(output_wl,wl_uniform,flux_out)                                      # interpolate master → output grid
+def simulate_model_spectrum(theta, broadening_method, emulator=ACTIVE_EMULATOR, limbdark=0.6, output_wl=None, wavelengths_by_line=None, device=None):
+    """
+    Simulate a model spectrum for given parameters.
+
+    Parameters
+    ----------
+    theta             : array [teff, logg, radius, logmdot, yhe, vsini]
+    broadening_method : str — 'rotBroad', 'fastRotBroad', 'vspace', or 'jax'
+    emulator          : str — 'anja' or 'vasilis'
+    limbdark          : float
+    output_wl         : array or None
+    wavelengths_by_line : dict or None — fixed per-line grids for emulator="vasilis"
+    device           : str or None — PyTorch device for emulator="vasilis"
+    """
+
+    if emulator == "anja":
+        theta_in_model = theta[:5]
+        norm_params    = normalize_theta(theta_in_model)
+        vsini          = theta[5]
+
+        flux_master         = model(norm_params[None, :], training=False).numpy().ravel()
+        flux_master_ordered = flux_master[order]
+        flux_unique         = flux_master_ordered[unique_idx]
+        flux_out            = np.interp(wl_uniform, master_wl_unique, flux_unique)
+        wl_out              = wl_uniform
+        
+
+    elif emulator == "vasilis":
+        theta = np.asarray(theta, dtype=float)
+        if theta.size == 6:
+            teff, logg, radius, logmdot, yhe, vsini = theta
+            vinf = VASILIS_FIXED["vinf"]
+            vturb = VASILIS_FIXED["vturb"]
+        elif theta.size == 8:
+            teff, logg, radius, logmdot, vinf, yhe, vturb, vsini = theta
+        else:
+            raise ValueError(
+                "For emulator='vasilis', theta must be either "
+                "[teff, logg, radius, logmdot, yhe, vsini] with "
+                "VASILIS_FIXED set from INDAT, or "
+                "[teff, logg, radius, logmdot, vinf, yhe, vturb, vsini]."
+            )
+
+        params = {
+            "Teff":   teff,
+            "logg":   logg,
+            "R":      radius,
+            "Mdot":   10**logmdot,
+            "v_inf":  vinf,    # injected fixed value
+            "Y_He":   yhe,
+            "v_turb": vturb,   # injected fixed value
+        }
+        results = emulate_hg_spectrum(
+            params,
+            emulator_dir=VASILIS_EMULATOR_DIR,
+            wavelengths_by_line=wavelengths_by_line,
+            device=device,
+        )
+
+        if vsini > 0:
+            results = {
+                line_name: {
+                    **line_data,
+                    "flux": apply_rotational_broadening(
+                        wl=line_data["wavelength"],
+                        flux=line_data["flux"],
+                        broadening_method=broadening_method,
+                        vsini=vsini,
+                        limbdark=limbdark,
+                    ),
+                }
+                for line_name, line_data in results.items()
+            }
+
+        if output_wl is None:
+            if wavelengths_by_line is not None:
+                output_wl_for_merge = np.unique(np.concatenate([np.asarray(w, dtype=np.float32) for w in wavelengths_by_line.values()]))
+            else:
+                all_wl = np.concatenate([d["wavelength"] for d in results.values()])
+                output_wl_for_merge = np.linspace(all_wl.min(), all_wl.max(), 5000)
+        else:
+            output_wl_for_merge = output_wl
+
+        merged = merge_line_spectra(results, output_wavelength=output_wl_for_merge, fill_value=1.0)
+        wl_out = merged["wavelength"]
+        flux_out = merged["flux"]
+
+    else:
+        raise ValueError(f"Unknown emulator '{emulator}'. Choose 'anja' or 'vasilis'.")
+
+    # Anja's emulator is a single continuous spectrum. Vasilis' per-line
+    # spectra are broadened before merging to avoid broadening across gaps.
+    if vsini > 0 and emulator == "anja":
+        flux_out = apply_rotational_broadening(
+            wl=wl_out,
+            flux=flux_out,
+            broadening_method=broadening_method,
+            vsini=vsini,
+            limbdark=limbdark,
+        )
+
+    if output_wl is not None and emulator == "anja":
+        flux_out = np.interp(output_wl, wl_out, flux_out)
+
     return flux_out
 
 def add_noise_to_spectrum(prediction, spectral_snr):
@@ -449,17 +588,24 @@ def add_noise_to_spectrum(prediction, spectral_snr):
     noisy_flux = prediction + np.random.normal(0.0, spectral_sigma, size=prediction.shape)
     return noisy_flux
 
-def simulate_kband_magnitude(theta):
+def simulate_kband_magnitude(theta, kband_unc=1/10):
     ''' Simulate the K-band magnitude for given parameters using a simple model based on the Planck function and filter transmission.'''
-    teff, logg, radius, logmdot, yhe, vsini = theta
-    model_flux = compute_obs_flux(teff, radius)     # Calculate the observed flux in the K-band based on the given parameters
-    kband_mag = flux_to_magnitude(model_flux)       # Convert the observed flux to a K-band magnitude
-    return kband_mag
+    if isinstance(theta, dict):
+        teff   = theta["Teff"]
+        radius = theta["R"]
+    else:
+        teff   = theta[0]
+        radius = theta[2]
+    model_flux = gnt.compute_obs_flux(teff, radius)      # Calculate the observed flux in the K-band based on the given parameters
+    kband_mag = gnt.flux_to_magnitude(model_flux)        # Convert the observed flux to a K-band magnitude
+    kband_noise = np.random.normal(0.0, kband_unc)       # Calculate the noise level for the K-band magnitude based on the specified uncertainty (kband_unc)
+    kband_mag_noisy = kband_mag + kband_noise            # Add Gaussian noise to the K-band magnitude based on the specified uncertainty
+    return kband_mag, kband_mag_noisy, kband_noise       # Return both the noisy K-band magnitude and the noise on the K-band magnitude for reference
 
 
 
 ####################################################
-####################### MCMC #######################
+################ Priors & Posteriors ###############
 ####################################################
 
 def log_prior(theta):
@@ -468,47 +614,82 @@ def log_prior(theta):
         return 0.0
     return -np.inf
 
-def make_log_posterior_with_kband(observed_wavelength,observed_flux,observed_kband,spectral_snr,broadening_method,kband_snr=20,limbdark=0.6,model=model):
-    ''' Create a log-posterior function that combines the likelihood of the observed spectrum and the observed K-band magnitude, given the model predictions and uncertainties.
-    model: keras model to predict the spectrum
-    observed_wavelength: wavelength grid of the observed spectrum
-    observed_flux: normalized observed spectrum
-    observed_kband: observed K-band magnitude
-    spectral_snr: signal-to-noise ratio of the observed spectrum (used to calculate the uncertainty for the spectral likelihood)
-    broadening_method: which methid to use to broad the spectrum, options are: 'Sarah', 'rotBroad', 'fastRotBroad'
-    kband_snr: signal-to-noise ratio of the K-band magnitude (used to calculate the uncertainty for the K-band likelihood)
-    limbdark: limb darkening coefficient for rotational broadening
-    '''
-    spectral_sigma = 1.0 / spectral_snr                                                                                             # Use the spectral SNR to calculate the uncertainty for the spectral likelihood
-    kband_sigma = 1.0 / kband_snr                                                                                                   # Use the K-band SNR to calculate the uncertainty
+def make_log_likelihood_with_kband(observed_wavelength, observed_flux, observed_kband, spectral_snr, broadening_method, emulator=ACTIVE_EMULATOR, kband_unc=1/10, limbdark=0.6):
+    """
+    Return a log-likelihood function combining spectral lines and K-band magnitude.
+    Can be used directly with nested sampling (UltraNest) or combined with a prior
+    for MCMC via make_log_posterior_with_kband.
+    ----------
+    observed_wavelength : array
+    observed_flux       : array
+    observed_kband      : float  — observed K-band magnitude
+    spectral_snr        : float  — SNR of the spectrum
+    broadening_method   : str
+    kband_unc           : float  — uncertainty of the K-band magnitude
+    limbdark            : float
+    -------
+    log_likelihood : callable
+        Function that takes theta (array of 6 parameters) and returns log-likelihood.
+    """
+
+    spectral_sigma = 1.0 / spectral_snr
 
     def log_likelihood_kband(theta):
-        sim_kband_mag = simulate_kband_magnitude(theta)                                                                             # Simulate the K-band magnitude for the given parameters using the model
+        sim_kband_mag, sim_kband_mag_noisy, sim_kband_noise = simulate_kband_magnitude(theta, kband_unc=kband_unc)                  # Simulate the K-band magnitude for the given parameters using the model
         residual_kband = observed_kband - sim_kband_mag                                                                             # Calculate the residual between the observed and simulated K-band magnitudes
-        ll_kband = -0.5 * (residual_kband / kband_sigma) ** 2                                                                       # Calculate the log-likelihood for the K-band magnitude assuming Gaussian errors
+        ll_kband       = -0.5 * (residual_kband / kband_unc) ** 2                                                                   # Calculate the log-likelihood for the K-band magnitude assuming Gaussian errors
         return ll_kband if np.isfinite(ll_kband) else -np.inf                                                                       # Return -inf if the log-likelihood is not finite (e.g., due to numerical issues)
-
+    
     def log_likelihood_lines(theta):
-        sim_flux = simulate_model_spectrum(theta, broadening_method, model=model, limbdark=limbdark, output_wl=observed_wavelength) # Simulate the model spectrum with noise and optional rotational broadening
+        sim_flux = simulate_model_spectrum(theta, broadening_method, emulator=emulator, limbdark=limbdark, output_wl=observed_wavelength) # Simulate the model spectrum with noise and optional rotational broadening
         valid = ~np.isnan(sim_flux)                                                                                                 # Only consider points where interpolation was valid (within the model's wavelength range)
         if not np.any(valid):                                                                                                       # If no valid points, return -inf to indicate zero likelihood
             return -np.inf
 
         residual_lines = observed_flux[valid] - sim_flux[valid]                                                                     # Calculate the residual between the observed and simulated spectra at the valid points
         ll_lines = -0.5 * np.sum((residual_lines / spectral_sigma) ** 2)                                                            # Calculate the log-likelihood for the spectral lines assuming Gaussian errors
-
         return ll_lines if np.isfinite(ll_lines) else -np.inf                                                                       # Return -inf if the log-likelihood is not finite (e.g., due to numerical issues)
 
+    def log_likelihood(theta):
+        return log_likelihood_lines(theta) + log_likelihood_kband(theta)
+
+    return log_likelihood
+
+def make_log_posterior_with_kband(observed_wavelength, observed_flux, observed_kband, spectral_snr, broadening_method, emulator=ACTIVE_EMULATOR, kband_unc=1/10, limbdark=0.6):
+    """
+    Return a log-posterior function for MCMC (log-prior + log-likelihood).
+    ----------
+    Same as make_log_likelihood_with_kband.
+    -------
+    log_posterior : callable
+        Function that takes theta and returns log-posterior.
+    """
+    log_likelihood = make_log_likelihood_with_kband(
+        observed_wavelength = observed_wavelength,
+        observed_flux       = observed_flux,
+        observed_kband      = observed_kband,
+        spectral_snr        = spectral_snr,
+        broadening_method   = broadening_method,
+        emulator            = emulator,
+        kband_unc           = kband_unc,
+        limbdark            = limbdark,
+    )
+
     def log_posterior_with_kband(theta):
-        lp = log_prior(theta)                                                                                                       # Calculate the log-prior for the given parameters
+        lp = log_prior(theta)
         if not np.isfinite(lp):
             return -np.inf
-        return lp + log_likelihood_lines(theta) + log_likelihood_kband(theta)                                                       # Combine the log-prior and log-likelihoods to get the log-posterior
+        return lp + log_likelihood(theta)
 
     return log_posterior_with_kband
 
-def run_mcmc_with_kband(observed_flux,observed_wavelength,observed_kband,spectral_snr,kband_snr,first_guess,broadening_method,
-                        model=model,limbdark=0.6,ndim=6,nwalkers=32,nsteps=5000,theta_true = None):
+
+####################################################
+####################### MCMC #######################
+####################################################
+
+def run_mcmc_with_kband(observed_flux,observed_wavelength,observed_kband,spectral_snr,kband_unc,first_guess,broadening_method,
+                        emulator=ACTIVE_EMULATOR,limbdark=0.6,ndim=None,nwalkers=24,nsteps=3000,theta_true = None):
     """
     Parameters
     ----------
@@ -516,14 +697,14 @@ def run_mcmc_with_kband(observed_flux,observed_wavelength,observed_kband,spectra
     observed_wavelength : array  — wavelength grid of observed spectrum (Å), also the grid on which the model spectrum will be evaluated and compared to the observed spectrum
     observed_kband      : float  — observed K-band magnitude
     spectral_snr        : float  — signal-to-noise ratio of the spectrum
-    kband_snr           : float  — signal-to-noise ratio of the K-band magnitude
-    first_guess         : array  — initial parameter guess [teff, logg, radius, logmdot, yhe, vsini]
+    kband_unc           : float  — uncertainty of the K-band magnitude
+    first_guess         : array  — initial parameter guess [teff, logg, radius, (log)mdot, yhe, vsini]
     broadening_method   : string - which broadening method to use, either 'Sarah', 'rotBroad', or 'fastRotBroad'
-    model               : keras model — neural network emulator
+    emulator            : string — active neural network emulator
     limbdark            : limb darkening coefficient for rotational broadening (default 0.6)
-    ndim                : int   — number of parameters (default 5)
-    nwalkers            : int   — number of MCMC walkers (default 32)
-    nsteps              : int   — number of MCMC steps (default 5000)
+    ndim                : int   — number of parameters
+    nwalkers            : int   — number of MCMC walkers (default 24)
+    nsteps              : int   — number of MCMC steps (default 3000)
     theta_true          : array or None — ground truth parameters for validation plots
 
     Notes
@@ -534,8 +715,9 @@ def run_mcmc_with_kband(observed_flux,observed_wavelength,observed_kband,spectra
         theta_50p    — median of posterior samples (returned as best estimate)
         theta_true   — known true values (only available for synthetic tests)
     """
-    log_posterior = make_log_posterior_with_kband(model=model,observed_wavelength=observed_wavelength,observed_flux=observed_flux,observed_kband=observed_kband,spectral_snr=spectral_snr,
-                broadening_method=broadening_method,kband_snr=kband_snr,limbdark=limbdark) # Create log-posterior function with the observed data (spectrum and kband magnitude) and model
+    start = time.perf_counter()
+    log_posterior = make_log_posterior_with_kband(observed_wavelength=observed_wavelength,observed_flux=observed_flux,observed_kband=observed_kband,spectral_snr=spectral_snr,
+                broadening_method=broadening_method,emulator=emulator,kband_unc=kband_unc,limbdark=limbdark) # Create log-posterior function with the observed data (spectrum and kband magnitude) and model
 
     # MAP estimate
     call_count = [0]
@@ -557,7 +739,9 @@ def run_mcmc_with_kband(observed_flux,observed_wavelength,observed_kband,spectra
     print(f"Initial position (MAP estimate): {dict(zip(PARAM_NAMES, np.round(theta_map, 3)))}")
 
     # Initialise walkers
-    scale = np.array([500, 0.05, 1, 0.1, 0.005, 1]) # Scale for initializing walkers around the MAP estimate (adjusted to be smaller than the prior range to ensure good starting positions)
+    if ndim is None:
+        ndim = len(PARAM_BOUNDS_ANJA) if emulator == "anja" else len(PARAM_BOUNDS_VASILIS)
+    scale = WALKER_SCALE[emulator] # Scale for initializing walkers around the MAP estimate (adjusted to be smaller than the prior range to ensure good starting positions)
     pos = []
     max_attempts = 100000
     attempts = 0
@@ -586,14 +770,13 @@ def run_mcmc_with_kband(observed_flux,observed_wavelength,observed_kband,spectra
         if theta_true is not None:
             axes[i].axhline(theta_true[i], color='red', linestyle='--', lw=1)
     axes[-1].set_xlabel("Step")
-    display(fig)
 
     # Sampling loop
     checkpoint_interval = max(1, nsteps // 10)
+    display_handle = None
     for i, _ in enumerate(sampler.sample(pos, iterations=nsteps)):
         if (i + 1) % checkpoint_interval == 0:
             acceptance = sampler.acceptance_fraction.mean()
-            clear_output(wait=True)
             chain = sampler.get_chain()  # (steps_so_far, nwalkers, ndim)
             for i_param in range(ndim):
                 axes[i_param].cla()
@@ -603,8 +786,10 @@ def run_mcmc_with_kband(observed_flux,observed_wavelength,observed_kband,spectra
                     axes[i_param].axhline(theta_true[i_param], color='red', linestyle='--', lw=1)
             axes[-1].set_xlabel("Step")
             fig.suptitle(f"Step {i+1}/{nsteps}  |  acceptance: {acceptance:.3f}")
-            display(fig)
-            plt.pause(0.01)
+            if display_handle is None:
+                display_handle = display(fig, display_id=True)
+            else:
+                display_handle.update(fig)
     print("Sampling complete.")
 
     # Post-processing
@@ -627,7 +812,7 @@ def run_mcmc_with_kband(observed_flux,observed_wavelength,observed_kband,spectra
     if len(flat_samples) < 1000:
         print("Warning: fewer than 1000 independent samples — consider running longer.")
     theta_50p = np.percentile(flat_samples, 50, axis=0) # Compute the median of the posterior samples for each parameter
-
+    elapsed = time.perf_counter() - start
     return {
         "observed_flux": observed_flux,
         "observed_wavelength": observed_wavelength,
@@ -640,14 +825,15 @@ def run_mcmc_with_kband(observed_flux,observed_wavelength,observed_kband,spectra
         "theta_50p": theta_50p,
         "discard": discard,
         "theta_true": theta_true,
+        "runtime_seconds": elapsed,
     }
 
 
 # --- print, save, plot ---
 
-def save_results(results, filename):
+def save_results(results, run, filename):
     np.savez(
-        filename,
+        os.path.join(ppp.MCMC_results_path, run, filename),
         observed_flux=results["observed_flux"],
         observed_wavelength=results["observed_wavelength"],
         observed_kband=results["observed_kband"],
@@ -658,11 +844,13 @@ def save_results(results, filename):
         chain=results["chain"],
         theta_50p=results["theta_50p"],
         discard=results["discard"],
+        runtime_seconds=results["runtime_seconds"],
         theta_true=results["theta_true"] if "theta_true" in results else None,
+        allow_pickle=True,
     )
 
-def load_results(filename):
-    data = np.load(filename, allow_pickle=True)
+def load_results(run, filename):
+    data = np.load(os.path.join(ppp.MCMC_results_path, run, filename), allow_pickle=True)
     return {
         "observed_flux": data["observed_flux"],
         "observed_wavelength": data["observed_wavelength"],
@@ -674,10 +862,12 @@ def load_results(filename):
         "chain": data["chain"],
         "discard": data["discard"],
         "theta_50p": data["theta_50p"],
+        "runtime_seconds": data["runtime_seconds"],
         "theta_true": data["theta_true"] if "theta_true" in data else None,
     }
 
-def print_posterior_summary(flat_samples, truths=None):
+def print_posterior_summary(flat_samples, runtime_seconds,truths=None):
+    print(f"Runtime {runtime_seconds:.1f} seconds")
     print("Median and 1σ uncertainties:")
     for i, label in enumerate(PARAM_NAMES):
         p16, p50, p84 = np.percentile(flat_samples[:, i], [15.85, 50, 84.15]) # 16th, 50th, and 84th percentiles correspond to median and ±1σ for a Gaussian distribution
@@ -693,7 +883,7 @@ def plot_corner(flat_samples, truths=None):
 def plot_chains(chain, ndim, discard, truths=None):
     fig, axes = plt.subplots(ndim, 1, figsize=(10, 10), sharex=True)
     for i in range(ndim):
-        axes[i].plot(chain[:, :, i].T, alpha=0.3, color='black')
+        axes[i].plot(chain[:, :, i], alpha=0.3, color='black')
         axes[i].axvline(discard, color='blue', linestyle='--', label='Discarded steps')
         if truths is not None:
             axes[i].axhline(truths[i], color='red', linestyle='-', label='True value')
@@ -702,19 +892,19 @@ def plot_chains(chain, ndim, discard, truths=None):
     axes[-1].set_xlabel("Step")
     plt.show()
 
-def plot_posterior_predictive(results,observed_flux,observed_wavelength,spectral_snr,broadening_method,model=model,limbdark=0.6, show_draws=True, n_draw=100):
+def plot_posterior_predictive(results,observed_flux,observed_wavelength,spectral_snr,broadening_method,emulator=ACTIVE_EMULATOR, limbdark=0.6, show_draws=True, n_draw=100):
     flat_samples = results["flat_samples"]
     theta_50p = results["theta_50p"]
 
     plt.figure(figsize=(15, 6))
-    sim_50p_flux = simulate_model_spectrum(theta_50p, broadening_method=broadening_method, model=model, limbdark=limbdark, output_wl=observed_wavelength) # Simulate the 50th percentile theta spectrum with noise and optional rotational broadening
-    sim_50p_flux = add_noise_to_spectrum(sim_50p_flux, spectral_snr) # Add noise to the simulated spectrum based on the specified SNR
+    sim_50p_flux = simulate_model_spectrum(theta_50p, broadening_method=broadening_method, emulator=emulator, limbdark=limbdark, output_wl=observed_wavelength) # Simulate the 50th percentile theta spectrum with noise and optional rotational broadening
+    #sim_50p_flux = add_noise_to_spectrum(sim_50p_flux, spectral_snr) # Add noise to the simulated spectrum based on the specified SNR
     plt.plot(observed_wavelength, observed_flux, color='black', label='Observed spectrum', lw=0.8)
     if show_draws:
         idx = np.random.choice(len(flat_samples), n_draw, replace=False) # Randomly select n_draw samples from the posterior without replacement
         draw_samples = flat_samples[idx] # Extract the selected samples for plotting
         for i, theta in enumerate(draw_samples):
-            sample_flux = simulate_model_spectrum(theta, broadening_method=broadening_method, model=model, limbdark=limbdark, output_wl=observed_wavelength) # Simulate the spectrum for this sample with noise and optional rotational broadening
+            sample_flux = simulate_model_spectrum(theta, broadening_method=broadening_method, emulator=emulator, limbdark=limbdark, output_wl=observed_wavelength) # Simulate the spectrum for this sample with noise and optional rotational broadening
             sample_flux = add_noise_to_spectrum(sample_flux, spectral_snr) # Add noise to the simulated spectrum based on the specified SNR
             plt.plot(observed_wavelength,sample_flux,color='tab:blue',alpha=0.25,linewidth=1,label=f"Posterior Predictive {n_draw} samples" if i == 0 else None)
     plt.plot(observed_wavelength, sim_50p_flux, color='orange', alpha=0.8, lw=1, label='Median posterior predictive')
@@ -745,33 +935,51 @@ def get_credible_interval_mcmc(flat_samples, truth, param_index):
     samples_1d = flat_samples[:, param_index] # extract one parameter
     return np.mean(samples_1d < truth) # fraction of samples below truth
 
-def run_coverage_test(wl_array_output, spectral_snr, kband_snr, broadening_method, N_sims=20, nsteps=5000, nwalkers=32, ndims=6, simulate=True, theta_true=None, model=model, limbdark=0.6):
+def run_MCMC_coverage_test(wl_array_output, spectral_snr, kband_unc, broadening_method, emulator=ACTIVE_EMULATOR, N_sims=20, nsteps=3000, nwalkers=24, ndims=None, simulate=True, save=True, run=None, theta_true=None, limbdark=0.6):
     """
-    Run a Bayesian coverage test (PP plot test) for all 5 parameters using repeated noisy simulations.
+    Run a Bayesian coverage test (PP plot test) for all 6 parameters using repeated noisy simulations.
     ----------
     wl_array : array
         Model wavelength grid.
     spectral_snr : float
         Noise level used for simulations of spectra and inference.
-    kband_snr : float
-        Noise level used for simulations of kband magnitude and inference.
+    kband_unc : float
+        Uncertainty of the K-band magnitude.
     broadening_method : string
         Which broadening method to use, either 'Sarah', 'rotBroad', or 'fastRotBroad'.
+    emulator : str
+        Active neural network emulator.
     N_sims : int
         Number of repeated simulations.
     nsteps, nwalkers, ndims: int
         MCMC control parameters.
     simulate : bool
         If True, simulate new true parameters for each run. If False, use provided theta_true for all runs. theta_true : array-like, shape (6,) If simulate=False, the true parameter values to use for all simulations.
+    save : bool
+        Whether to save individual simulation results and the summary. If True, requires a non-None run name to save under.
+    run : str or None
+        Name of the run for saving results. If None, results will not be saved even if save=True.
     theta_true : array-like, shape (N_sims, 6) or (6,)
         If simulate=False, the true parameter values to use for all simulations. If shape is (6,), the same true parameters will be used for all simulations. If shape is (N_sims, 6), each row will be used as the true parameters for one simulation.
-    model : keras model
-        Your neural network spectral emulator.
     limbdark : float
         limbdarkening.
     -------
     credible_dict : dict
         Credible ranks for each parameter.
+    theta_true : array
+        True parameter values used in each simulation.
+    flat_samples_all : list
+        Flat MCMC samples for each simulation.
+    guesses : array
+        First guesses used in each simulation.
+    discard_all : list
+        Burn-in discards for each simulation.
+    chain_all : list
+        Full MCMC chains for each simulation.
+    results_all : list
+        Full result dicts for each simulation.
+    runtime_seconds_all : list
+        Wall-clock runtimes for each simulation.
     """
     # Sample N true values for each parameter from the prior range
     if simulate:
@@ -781,47 +989,113 @@ def run_coverage_test(wl_array_output, spectral_snr, kband_snr, broadening_metho
     guesses = np.column_stack([np.random.uniform(lo, hi, size=N_sims) for lo, hi in PARAM_BOUNDS])
 
     credible_dict = {name: [] for name in PARAM_NAMES} # Storage: one list per parameter
-    flat_samples_all, chain_all, discard_all, results_all = [], [], [], [] # Storage for all flat samples, chains, discards, and results
+    flat_samples_all, chain_all, discard_all, results_all, runtime_seconds_all = [], [], [], [], [] # Storage for all flat samples, chains, discards, and results
     print(f"Running coverage test with N_sims = {N_sims}")
 
     for k in range(N_sims): # Loop over repeated simulations
 
         print(f"Simulation {k+1}/{N_sims}")
+        sim_filename = f"sim_{k:03d}.npz"
 
-        observed_flux = simulate_model_spectrum(theta_true[k],broadening_method=broadening_method, model=model,limbdark=limbdark,output_wl=wl_array_output) # Simulate the observed spectrum for the true parameters on the output wavelength grid
-        observed_flux = add_noise_to_spectrum(observed_flux, spectral_snr) # Add noise to the simulated spectrum based on the specified SNR
-        observed_kband = simulate_kband_magnitude(theta_true[k]) + np.random.normal(0, 1/kband_snr) # Simulate the observed K-band magnitude for the true parameters and add noise based on the specified K-band SNR
+        # --- Simulate or load observed data ---
+        if save and run is not None and os.path.exists(os.path.join(ppp.MCMC_results_path, run, sim_filename)):
+            # Reuse existing simulated spectrum and kband
+            print(f"  Loading existing simulation from {sim_filename}")
+            existing = load_results(run, sim_filename)
+            theta_true[k]    = existing["theta_true"]
+            guesses[k]       = existing["first_guess"]
+            results_all.append(existing)
+            runtime_seconds_all.append(existing["runtime_seconds"])
+            discard_all.append(existing["discard"])
+            chain_all.append(existing["chain"])
+            flat_samples_all.append(existing["flat_samples"])
+
+            for j, name in enumerate(PARAM_NAMES): # Compute credible ranks for each parameter
+                u = get_credible_interval_mcmc(existing["flat_samples"], truth=theta_true[k, j], param_index=j)
+                credible_dict[name].append(u)
+            continue
+
+        # --- No saved result: simulate fresh data ---
+        observed_flux  = simulate_model_spectrum(theta_true[k], broadening_method=broadening_method, emulator=emulator, limbdark=limbdark, output_wl=wl_array_output)
+        observed_flux  = add_noise_to_spectrum(observed_flux, spectral_snr)
+        _, observed_kband, kband_noise = simulate_kband_magnitude(theta_true[k], kband_unc=kband_unc)
 
         # Run inference
+        start   = time.perf_counter()
         results = run_mcmc_with_kband(
-            observed_flux=observed_flux,
-            observed_wavelength=wl_array_output,
-            observed_kband=observed_kband,
-            spectral_snr=spectral_snr,
-            kband_snr=kband_snr,
-            first_guess=guesses[k],
-            broadening_method = broadening_method,
-            model=model,
-            limbdark=limbdark,
-            ndim=ndims,
-            nwalkers=nwalkers,
-            nsteps=nsteps,
-            theta_true = theta_true[k],
+            observed_flux      = observed_flux,
+            observed_wavelength= wl_array_output,
+            observed_kband     = observed_kband,
+            spectral_snr       = spectral_snr,
+            kband_unc          = kband_unc,
+            first_guess        = guesses[k],
+            broadening_method  = broadening_method,
+            emulator           = emulator,
+            limbdark           = limbdark,
+            ndim               = ndims,
+            nwalkers           = nwalkers,
+            nsteps             = nsteps,
+            theta_true         = theta_true[k],
         )
+        runtime_seconds = time.perf_counter() - start
 
+        results["observed_flux"]        = observed_flux
+        results["observed_wavelength"]  = wl_array_output
+        results["observed_kband"]       = observed_kband
+        results["spectral_snr"]         = spectral_snr
+        results["first_guess"]          = guesses[k]
+        results["theta_true"]           = theta_true[k]
+        results["runtime_seconds"]      = runtime_seconds
+        
         results_all.append(results)
+        runtime_seconds_all.append(runtime_seconds)
         discard_all.append(results["discard"])
         chain_all.append(results["chain"])
         flat_samples_all.append(results["flat_samples"])
 
         for j, name in enumerate(PARAM_NAMES): # Compute credible ranks for each parameter
-
             u = get_credible_interval_mcmc(results["flat_samples"],truth=theta_true[k,j],param_index=j)
             credible_dict[name].append(u)
+        
+        # --- Save per-simulation results ---
+        if save and run is not None:
+            save_results(results, run, sim_filename)
+        
+    # --- Save summary ---
+    if save and run is not None:
+        np.savez(
+            os.path.join(ppp.MCMC_results_path, run, "coverage_summary.npz"),
+            theta_true=theta_true,
+            credible_dict=credible_dict,
+            guesses=guesses,
+        )
+    return credible_dict, theta_true, flat_samples_all, guesses, discard_all, chain_all, results_all, runtime_seconds_all
 
-    return credible_dict, theta_true, flat_samples_all, guesses, discard_all, chain_all, results_all
+def credible_to_sigma_regions(credible_dict, param_names=None):
+    param_names = param_names or list(credible_dict.keys())
 
-#def plot_mcmc_sigma_regions(coverage, param_names, )
+    coverage_dicts = {r: {p: [] for p in param_names} for r in [
+        "below_2sig",
+        "between_2sig_1sig_lo",
+        "between_1sigs",
+        "between_1sig_2sig_hi",
+        "above_2sig",
+    ]}
+
+    for p in param_names:
+        for u in credible_dict[p]:
+            if np.isnan(u):
+                for r in coverage_dicts:
+                    coverage_dicts[r][p].append(None)
+                continue
+
+            coverage_dicts["below_2sig"][p].append(u < 0.025)
+            coverage_dicts["between_2sig_1sig_lo"][p].append(0.025 <= u < 0.158)
+            coverage_dicts["between_1sigs"][p].append(0.158 <= u <= 0.841)
+            coverage_dicts["between_1sig_2sig_hi"][p].append(0.841 < u <= 0.975)
+            coverage_dicts["above_2sig"][p].append(u > 0.975)
+
+    return coverage_dicts
 
 def plot_coverage_all_params(credible_dict):
     """
@@ -858,3 +1132,802 @@ def plot_coverage_all_params(credible_dict):
     ax.set_title(f"Coverage test (PP plot) with {N} simulations")
     ax.legend()
     plt.show()
+
+
+####################################################
+################ Nested Sampling ###################
+####################################################
+
+def run_NS_with_kband(observed_flux, observed_wavelength, observed_kband, spectral_snr, kband_unc, broadening_method, emulator=ACTIVE_EMULATOR,
+                      limbdark=0.6, theta_true=None, run_name=None, log_dir=None, n_live_points=400, plot_corner=False, viz_callback=None):
+    """
+    Run UltraNest nested sampling with a combined spectral + K-band likelihood.
+    Returns a result dict compatible with save_ns_results / load_ns_results and
+    the existing comparison functions (plot_posteriors_with_estimates,
+    plot_bias_vs_true, print_comparison_summary).
+
+    Parameters
+    ----------
+    observed_flux       : array  — normalised observed spectrum
+    observed_wavelength : array  — wavelength grid
+    observed_kband      : float  — observed K-band magnitude
+    spectral_snr        : float  — SNR of the spectrum
+    kband_unc           : float  — uncertainty of the K-band magnitude
+    broadening_method   : str    — e.g. 'vspace', 'rotBroad', 'fastRotBroad'
+    emulator            : str    — active neural network emulator
+    limbdark            : float  — limb darkening coefficient (default 0.6)
+    theta_true          : array or None — ground truth for validation
+    run_name            : str or None — unique name for this run, used to set
+                          log_dir automatically. If both run_name and log_dir
+                          are given, log_dir takes precedence.
+    log_dir             : str or None — directory for UltraNest output files.
+                          If None, defaults to
+                          ppp.nested_sampling_results_path / 'ultranest_runs' / run_name
+                          (or 'default' if run_name is also None).
+    n_live_points       : int   — number of live points (default 400;
+                          increase for higher accuracy at greater cost)
+    plot_corner         : bool — whether to plot corner plots
+    viz_callback        : callable or None — passed to sampler.run().
+
+    Notes
+    -----
+    theta naming convention (same as run_mcmc_with_kband):
+        theta_map  — highest-likelihood posterior sample (posterior mode)
+        theta_50p  — posterior median computed from flat_samples
+        theta_true — known true values (synthetic tests only)
+
+    The result dict contains MCMC-compatible keys (flat_samples, theta_map,
+    theta_50p, chain, discard) so all existing comparison and plotting
+    functions work without modification, plus NS-specific keys (ns_results,
+    log_evidence, log_evidence_err, n_live_points).
+
+    Returns
+    -------
+    result : dict
+    """
+    import ultranest
+    import ultranest.plot
+
+    start = time.perf_counter()
+
+    # --- likelihood and prior ---
+    log_likelihood = make_log_likelihood_with_kband(
+        observed_wavelength = observed_wavelength,
+        observed_flux       = observed_flux,
+        observed_kband      = observed_kband,
+        spectral_snr        = spectral_snr,
+        kband_unc           = kband_unc,
+        broadening_method   = broadening_method,
+        emulator            = emulator,
+        limbdark            = limbdark,        
+    )
+
+    def prior_transform(cube):
+        params = cube.copy()
+        for i, (lo, hi) in enumerate(PARAM_BOUNDS):
+            params[i] = lo + (hi - lo) * cube[i]
+        return params
+
+    # --- set up log_dir — unique per run to avoid resume collisions ---
+    if log_dir is None:
+        if run_name is not None:
+            # expect run_name like "NS_coverage_v3_sim_019"
+            # derive experiment folder from prefix, e.g. "NS_coverage_v3"
+            experiment = "_".join(run_name.split("_")[:-2])   # strip _sim_019
+            log_dir = os.path.join(
+                ppp.nested_sampling_results_path, experiment, run_name, "ultranest"
+            )
+        else:
+            log_dir = os.path.join(
+                ppp.nested_sampling_results_path, "default", "ultranest"
+            )
+    os.makedirs(log_dir, exist_ok=True)
+
+    # --- set up sampler ---
+
+    sampler = ultranest.ReactiveNestedSampler(
+        param_names = PARAM_NAMES,
+        loglike     = log_likelihood,
+        transform   = prior_transform,
+        log_dir     = log_dir,
+        resume      = 'overwrite' if run_name is None else True,
+    )
+
+    print(f"Starting Nested Sampling with {n_live_points} live points.")
+    ns_results = sampler.run(
+        min_num_live_points = n_live_points,
+        viz_callback        = viz_callback,
+        show_status         = True,
+    )
+    sampler.print_results()
+
+    elapsed = time.perf_counter() - start
+
+    # --- extract posterior samples ---
+    points  = np.array(ns_results['weighted_samples']['points'])  # shape (N, ndim)
+    weights = np.array(ns_results['weighted_samples']['weights'])  # sums to 1
+
+    # Resample to equally-weighted flat_samples for compatibility with
+    # get_credible_interval_mcmc, plot_corner, plot_posteriors_with_estimates
+    rng          = np.random.default_rng()
+    n_draw       = min(10_000, len(points))
+    idx          = rng.choice(len(points), size=n_draw, replace=True, p=weights / weights.sum())
+    flat_samples = points[idx]
+
+    # --- point estimates ---
+    # theta_50p: posterior median, consistent with MCMC convention
+    theta_50p = np.percentile(flat_samples, 50, axis=0)
+
+    # theta_map: highest-likelihood sample (posterior mode)
+    theta_map = points[np.argmax(ns_results['weighted_samples']['logl'])]
+
+    # --- diagnostics ---
+    log_evidence     = ns_results['logz']
+    log_evidence_err = ns_results['logzerr']
+    print(f"\n--- Nested Sampling diagnostics ---")
+    print(f"  log Z            : {log_evidence:.2f} ± {log_evidence_err:.2f}")
+    print(f"  Effective samples: {ns_results['ess']:.0f}")
+    print(f"  Runtime          : {elapsed:.1f} s ({elapsed/60:.2f} min)")
+    print(f"  Number of calls   : {ns_results['ncall']}")
+    for i, name in enumerate(PARAM_NAMES):
+        p16 = np.percentile(flat_samples[:, i], 15.87)
+        p50 = np.percentile(flat_samples[:, i], 50)
+        p84 = np.percentile(flat_samples[:, i], 84.13)
+        truth_str = f", true = {theta_true[i]:.3f}" if theta_true is not None else ""
+        print(f"  {name:<10s}: {p50:.4f}  -{p50-p16:.4f}/+{p84-p50:.4f}{truth_str}")
+
+    # --- corner plot ---
+    if plot_corner:
+        ultranest.plot.cornerplot(ns_results, truths = theta_true, truth_color = 'red')
+        plt.show()
+
+    return {
+        # MCMC-compatible keys
+        "observed_flux"      : observed_flux,
+        "observed_wavelength": observed_wavelength,
+        "observed_kband"     : observed_kband,
+        "spectral_snr"       : spectral_snr,
+        "first_guess"        : theta_map,   # NS has no first_guess; MAP is closest equivalent
+        "flat_samples"       : flat_samples,
+        "theta_map"          : theta_map,
+        "theta_50p"          : theta_50p,
+        "discard"            : 0,           # no burn-in in NS; kept for compatibility
+        "chain"              : np.expand_dims(points, axis=1),  # (N,1,ndim) for plot_chains
+        "theta_true"         : theta_true,
+        "runtime_seconds"    : elapsed,
+        "n_calls"           : ns_results['ncall'],
+        # NS-specific keys
+        "ns_results"         : ns_results,
+        "n_live_points"      : n_live_points,
+        "log_evidence"       : log_evidence,
+        "log_evidence_err"   : log_evidence_err,
+    }
+
+def save_ns_results(results, run, filename):
+    """
+    Save NS results to disk. MCMC-compatible keys go to an .npz file;
+    ns_results (which contains nested dicts) goes to a separate .pkl file.
+    """
+    import pickle
+    os.makedirs(os.path.join(ppp.nested_sampling_results_path, run), exist_ok=True)
+    np.savez(
+        os.path.join(ppp.nested_sampling_results_path, run, filename),
+        observed_flux       = results["observed_flux"],
+        observed_wavelength = results["observed_wavelength"],
+        observed_kband      = results["observed_kband"],
+        spectral_snr        = results["spectral_snr"],
+        first_guess         = results["first_guess"],
+        flat_samples        = results["flat_samples"],
+        theta_map           = results["theta_map"],
+        theta_50p           = results["theta_50p"],
+        chain               = results["chain"],
+        discard             = results["discard"],
+        runtime_seconds     = results["runtime_seconds"],
+        theta_true          = results["theta_true"] if results["theta_true"] is not None else np.array([]),
+        log_evidence        = results["log_evidence"],
+        log_evidence_err    = results["log_evidence_err"],
+        n_live_points       = results["n_live_points"],
+    )
+    pkl_path = os.path.join(ppp.nested_sampling_results_path, run, filename.replace(".npz", "_ns_results.pkl"))
+    with open(pkl_path, "wb") as f:
+        pickle.dump(results["ns_results"], f)
+
+def load_ns_results(run, filename):
+    """
+    Load NS results saved by save_ns_results. Returns a dict with the same
+    keys as run_NS_with_kband, so all plotting functions work identically.
+    """
+    import pickle
+    data = np.load(os.path.join(ppp.nested_sampling_results_path, run, filename), allow_pickle=True)
+    pkl_path = os.path.join(ppp.nested_sampling_results_path, run, filename.replace(".npz", "_ns_results.pkl"))
+    with open(pkl_path, "rb") as f:
+        ns_results = pickle.load(f)
+    return {
+        "observed_flux"      : data["observed_flux"],
+        "observed_wavelength": data["observed_wavelength"],
+        "observed_kband"     : data["observed_kband"],
+        "spectral_snr"       : float(data["spectral_snr"]),
+        "first_guess"        : data["first_guess"],
+        "flat_samples"       : data["flat_samples"],
+        "theta_map"          : data["theta_map"],
+        "theta_50p"          : data["theta_50p"],
+        "chain"              : data["chain"],
+        "discard"            : int(data["discard"]),
+        "runtime_seconds"    : float(data["runtime_seconds"]),
+        "theta_true"         : data["theta_true"] if data["theta_true"].shape != (0,) else None,
+        "log_evidence"       : float(data["log_evidence"]),
+        "log_evidence_err"   : float(data["log_evidence_err"]),
+        "n_live_points"      : int(data["n_live_points"]),
+        "ns_results"         : ns_results,
+    }
+
+####################################################
+########### Nested Sampling Coverage Test###########
+####################################################
+def run_NS_coverage_test(spectral_snr, kband_unc, broadening_method, emulator=ACTIVE_EMULATOR, wl_array_output=None, mcmc_run=None, plot_corner=False, viz_callback=None,
+                         N_sims=20, n_live_points=400, save=True, run=None, theta_true=None, limbdark=0.6):
+    """
+    Run a coverage test for Nested Sampling.
+
+    Two modes:
+    - mcmc_run is provided: reuses pre-simulated spectra from that MCMC coverage run. Recommended for a fair method comparison.
+    - mcmc_run is None: generates fresh simulated spectra from scratch. In this case wl_array_output and theta_true must be provided or theta_true=None to draw randomly from PARAM_BOUNDS.
+
+    Parameters
+    ----------
+    spectral_snr        : float  — SNR of the spectrum
+    kband_unc           : float  — uncertainty of the K-band magnitude
+    broadening_method   : str    — broadeing method e.g. 'vspace', 'rotBroad', 'fastRotBroad'
+    emulator            : str    — active neural network emulator
+    wl_array_output     : array or None
+        Wavelength grid. Required when mcmc_run=None.
+    mcmc_run            : str or None
+        Name of the MCMC coverage run to load spectra from. If None, fresh spectra are simulated.
+    N_sims              : int    — number of simulations
+    n_live_points       : int    — UltraNest live points per simulation
+    save                : bool   — whether to save results to disk
+    run                 : str or None — name for this NS coverage run
+    theta_true          : array, shape (N_sims, n_params), or None
+        True parameter values to use when mcmc_run=None. If None, drawn randomly from PARAM_BOUNDS.
+    limbdark            : float
+
+    Returns
+    -------
+    credible_dict       : dict   — {param: [credible_rank_per_sim]}
+    theta_true_all      : array  — shape (N_sims, n_params)
+    results_all         : list   — one result dict per simulation
+    runtime_seconds_all : list   — wall-clock runtime per simulation
+    """
+
+    # --- set up ground truth and observed data source ---
+    if mcmc_run is not None:
+        # Load all pre-simulated spectra from the MCMC coverage run
+        print(f"Loading {N_sims} pre-simulated spectra from MCMC run '{mcmc_run}'")
+        mcmc_sims = []
+        for k in range(N_sims):
+            sim_path = os.path.join(ppp.MCMC_results_path, mcmc_run, f"sim_{k:03d}.npz")
+            if not os.path.exists(sim_path):
+                raise FileNotFoundError(
+                    f"MCMC simulation {k} not found at {sim_path}. "
+                    f"Run the MCMC coverage test first with run='{mcmc_run}'."
+                )
+            mcmc_sims.append(load_results(mcmc_run, f"sim_{k:03d}.npz"))
+        theta_true_all = np.array([s["theta_true"] for s in mcmc_sims])
+    else:
+        # Generate fresh spectra — wl_array_output is required
+        if wl_array_output is None:
+            raise ValueError("wl_array_output must be provided when mcmc_run=None.")
+        mcmc_sims = None
+        if theta_true is not None:
+            theta_true_all = np.atleast_2d(theta_true)
+            if theta_true_all.shape == (len(PARAM_NAMES),):
+                # Single theta_true broadcast to all sims
+                theta_true_all = np.tile(theta_true_all, (N_sims, 1))
+        else:
+            theta_true_all = np.column_stack([
+                np.random.uniform(lo, hi, size=N_sims) for lo, hi in PARAM_BOUNDS
+            ])
+        print(f"Generating {N_sims} fresh simulated spectra")
+
+    credible_dict       = {name: [] for name in PARAM_NAMES}
+    results_all         = []
+    runtime_seconds_all = []
+
+    print(f"Running NS coverage test with N_sims={N_sims}, n_live_points={n_live_points}")
+
+    for k in range(N_sims):
+        print(f"\nSimulation {k+1}/{N_sims}")
+        sim_filename = f"sim_{k:03d}.npz"
+
+        # --- Check if this NS simulation is already complete ---
+        if save and run is not None:
+            ns_path = os.path.join(ppp.nested_sampling_results_path, run, sim_filename)
+            if os.path.exists(ns_path):
+                print(f"  Loading existing NS results from {sim_filename}")
+                existing = load_ns_results(run, sim_filename)
+                results_all.append(existing)
+                runtime_seconds_all.append(existing["runtime_seconds"])
+                for j, name in enumerate(PARAM_NAMES):
+                    u = get_credible_interval_mcmc(
+                        existing["flat_samples"], truth=theta_true_all[k, j], param_index=j
+                    )
+                    credible_dict[name].append(u)
+                continue
+
+        # --- Get or generate observed data ---
+        if mcmc_sims is not None:
+            # Reuse MCMC pre-simulated spectrum
+            observed_flux       = mcmc_sims[k]["observed_flux"]
+            observed_wavelength = mcmc_sims[k]["observed_wavelength"]
+            observed_kband      = mcmc_sims[k]["observed_kband"]
+        else:
+            # Simulate fresh data
+            observed_flux  = simulate_model_spectrum(theta_true_all[k], broadening_method=broadening_method, emulator=emulator, limbdark=limbdark, output_wl=wl_array_output)
+            observed_flux  = add_noise_to_spectrum(observed_flux, spectral_snr)
+            _, observed_kband, kband_noise = simulate_kband_magnitude(theta_true_all[k], kband_unc=kband_unc)
+            observed_wavelength = wl_array_output
+
+        # --- Run NS ---
+        results = run_NS_with_kband(
+            observed_flux       = observed_flux,
+            observed_wavelength = observed_wavelength,
+            observed_kband      = observed_kband,
+            spectral_snr        = spectral_snr,
+            kband_unc           = kband_unc,
+            broadening_method   = broadening_method,
+            emulator            = emulator,
+            limbdark            = limbdark,
+            theta_true          = theta_true_all[k],
+            run_name            = f"{run}_sim_{k:03d}" if run is not None else f"ns_coverage_sim_{k:03d}",
+            n_live_points       = n_live_points,
+            plot_corner         = plot_corner,
+            viz_callback        = viz_callback,
+        )
+
+        results_all.append(results)
+        runtime_seconds_all.append(results["runtime_seconds"])
+
+        for j, name in enumerate(PARAM_NAMES):
+            u = get_credible_interval_mcmc(
+                results["flat_samples"], truth=theta_true_all[k, j], param_index=j
+            )
+            credible_dict[name].append(u)
+
+        if save and run is not None:
+            os.makedirs(os.path.join(ppp.nested_sampling_results_path, run), exist_ok=True)
+            save_ns_results(results, run, sim_filename)
+
+    # --- Save summary ---
+    if save and run is not None:
+        np.savez(
+            os.path.join(ppp.nested_sampling_results_path, run, "coverage_summary.npz"),
+            theta_true    = theta_true_all,
+            credible_dict = credible_dict,
+        )
+
+    return credible_dict, theta_true_all, results_all, runtime_seconds_all
+
+
+def load_ns_coverage_summary(run, N_sims):
+    """
+    Reload a completed NS coverage test from disk without re-running.
+
+    Parameters
+    ----------
+    run    : str — name of the NS coverage run
+    N_sims : int — number of simulations in the run
+
+    Returns
+    -------
+    credible_dict       : dict
+    theta_true_all      : array
+    results_all         : list of dicts
+    runtime_seconds_all : list of floats
+    """
+    summary = np.load(os.path.join(ppp.nested_sampling_results_path, run, "coverage_summary.npz"),allow_pickle=True)
+    credible_dict  = summary["credible_dict"].item()
+    theta_true_all = summary["theta_true"]
+    results_all, runtime_seconds_all = [], []
+    for k in range(N_sims):
+        r = load_ns_results(run, f"sim_{k:03d}.npz")
+        results_all.append(r)
+        runtime_seconds_all.append(r["runtime_seconds"])
+    return credible_dict, theta_true_all, results_all, runtime_seconds_all
+
+
+####################################################
+############ Multi-method comparison plot ##########
+####################################################
+
+
+def plot_posteriors_with_estimates(
+    sim_index,
+    flat_samples_MCMC_all,
+    theta_true_all,
+    param_names=None,
+    param_bounds=None,
+    plot_spectrum=False,            # whether to plot the observed spectrum + best fits
+    broadening_method='vspace',
+    emulator=ACTIVE_EMULATOR,
+    # --- MCMC ---
+    mcmc_results_all=None,          # list of result dicts from run_mcmc_with_kband
+    # --- GA ---
+    ga_results_all=None,            # list of result dicts from gnt.get_ga_best_and_intervals
+    ga_kband_all=None,              # needed for radius intervals
+    kband_unc=0.0,           # uncertainty in K-band magnitudes
+    # --- NS ---
+    nested_sampling_results_all=None, # list of result dicts from run_NS_with_kband
+    # --- add future methods here as keyword arguments ---
+    # eg. nested_sampling_results_all=None,
+):
+    """
+    For one simulation, plot the MCMC posterior for each parameter as a
+    histogram, overlaid with point estimates and 1σ intervals from other
+    methods (GA, etc.) and the true value.
+
+    Parameters
+    ----------
+    sim_index : int
+        Which simulation to plot (indexes into all the *_all lists).
+    flat_samples_all : list of arrays, shape (N_sims, n_samples, n_params)
+        MCMC posterior samples per simulation, from run_MCMC_coverage_test.
+    theta_true_all : array, shape (N_sims, n_params)
+        True parameter values per simulation.
+    param_names : list of str or None
+        Defaults to PARAM_NAMES.
+    param_bounds : array, shape (n_params, 2) or None
+        Defaults to PARAM_BOUNDS. Used to set x-axis limits.
+    mcmc_results_all : list of result dicts or None
+        If provided, the MCMC MAP estimate (theta_map) is shown as a vertical line.
+    ga_results_all : list of result dicts or None
+        If provided, GA best fit + 1σ interval is shown per parameter.
+    ga_kband_all : array-like or None
+        K-band magnitudes for each simulation, needed to derive GA radius intervals.
+    nested_sampling_results_all : list of result dicts or None
+        If provided, NS estimate and 1σ interval are shown per parameter.
+    """
+    param_names  = param_names  or PARAM_NAMES
+    param_bounds = param_bounds if param_bounds is not None else PARAM_BOUNDS
+    n_params     = len(param_names)
+
+    flat_samples_MCMC = flat_samples_MCMC_all[sim_index]# (n_samples, n_params)
+    theta_true   = theta_true_all[sim_index]            # (n_params,)
+
+    n_cols = 3
+    n_rows = int(np.ceil(n_params / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3.5 * n_rows))
+    axes = np.array(axes).flatten()
+
+    for j, name in enumerate(param_names):
+        ax = axes[j]
+        samples_1d = flat_samples_MCMC[:, j]
+
+        # --- MCMC posterior histogram ---
+        ax.hist(samples_1d, bins=40, density=True, color="steelblue",alpha=0.5, label="MCMC posterior")
+
+        # --- MCMC 1σ interval (shaded) ---
+        p16, p50, p84 = np.percentile(samples_1d, [15.85, 50, 84.15])
+        ax.axvspan(p16, p84, alpha=0.15, color="steelblue", label="MCMC 1σ")
+        ax.axvline(p50, color="steelblue", lw=1.5, linestyle="-", label="MCMC median")
+
+        # --- MCMC MAP (optional) ---
+        #if mcmc_results_all is not None:
+        #    theta_map = mcmc_results_all[sim_index].get("theta_map")
+        #    if theta_map is not None:
+        #        ax.axvline(theta_map[j], color="steelblue", lw=1.5,linestyle="--", label="MCMC MAP")
+
+        # --- GA best fit + 1σ (optional) ---
+        if ga_results_all is not None and ga_results_all[sim_index] is not None:
+            ga_result = ga_results_all[sim_index]
+            if name == "radius":
+                if ga_kband_all is not None:
+                    ri = gnt.get_radius_intervals_from_kband(ga_result, ga_kband_all[sim_index], kband_unc=kband_unc)
+                    ga_best, ga_lo1sig, ga_hi1sig = ri["best"], ri["lower_1sig"], ri["upper_1sig"]
+                else:
+                    ga_best, ga_lo1sig, ga_hi1sig = None, None, None    
+            else:
+                ga_name   = GA_NAME_MAP.get(name)
+                ga_best   = ga_result["best"].get(ga_name) if ga_name else None
+                ga_lo1sig = ga_result["lower_1sig"].get(ga_name) if ga_name else None
+                ga_hi1sig = ga_result["upper_1sig"].get(ga_name) if ga_name else None
+            if ga_best is not None:
+                ax.axvline(ga_best, color="darkorange", lw=1.5,linestyle="-", label="GA best fit")
+            if ga_lo1sig is not None and ga_hi1sig is not None:
+                ax.axvspan(ga_lo1sig, ga_hi1sig, alpha=0.15,color="darkorange", label="GA 1σ")
+
+        # NS best fit + 1σ
+        if nested_sampling_results_all is not None and nested_sampling_results_all[sim_index] is not None:
+            ns = nested_sampling_results_all[sim_index]
+            ns_samples1d = ns["flat_samples"][:, j]
+            ns_p16, ns_p50, ns_p84 = np.percentile(ns_samples1d, [15.87, 50, 84.13])
+            ax.hist(ns_samples1d, bins=40, density=True, color="green", alpha=0.4, label="NS posterior")
+            ax.axvspan(ns_p16, ns_p84, alpha=0.15, color="green", label="NS 1σ")
+            ax.axvline(ns_p50, color="green", lw=1.5, linestyle="-", label="NS median")
+
+        # --- add future methods here, e.g.:
+        # if nested_sampling_results_all is not None:
+        #     ns = nested_sampling_results_all[sim_index]
+        #     ax.axvline(ns["median"][j], color="green", lw=1.5, label="NS median")
+        #     ax.axvspan(ns["lo1sig"][j], ns["hi1sig"][j], alpha=0.15, color="green")
+
+        # --- true value ---
+        ax.axvline(theta_true[j], color="red", lw=2,linestyle="--", label="True value")
+
+        ax.set_xlabel(name)
+        ax.set_ylabel("Density")
+        ax.set_xlim(param_bounds[j])
+        ax.set_title(name)
+        if j == 0:
+            ax.legend(fontsize=7, loc="upper right")
+    
+    for idx in range(n_params, len(axes)):
+        axes[idx].set_visible(False)
+
+    if mcmc_results_all is not None:
+        print(f"Runtime MCMC: {mcmc_results_all[sim_index]['runtime_seconds']:.1f} s")
+    if ga_results_all is not None:
+        print(f"Runtime GA:   {ga_results_all[sim_index]['runtime_seconds']:.1f} s")
+    if nested_sampling_results_all is not None:
+        print(f"Runtime NS:   {nested_sampling_results_all[sim_index]['runtime_seconds']:.1f} s")
+
+    fig.suptitle(f"Simulation {sim_index}  —  posterior comparison", fontsize=13)
+    plt.tight_layout()
+    plt.show()
+
+    if plot_spectrum:
+        obs_wl   = mcmc_results_all[sim_index]['observed_wavelength']
+        obs_flux = mcmc_results_all[sim_index]['observed_flux']
+
+        fig_spec, ax_spec = plt.subplots(figsize=(14, 6))
+        ax_spec.plot(obs_wl, obs_flux, lw=0.8, label='Observed', color='black', alpha=0.7)
+
+        if mcmc_results_all is not None and mcmc_results_all[sim_index] is not None:
+            mcmc_flux = simulate_model_spectrum(mcmc_results_all[sim_index]['theta_50p'], broadening_method=broadening_method, emulator=emulator, limbdark=0.6, output_wl=obs_wl)
+            ax_spec.plot(obs_wl, mcmc_flux, lw=1, label='Best fit MCMC (median)', color='steelblue')
+
+        if ga_results_all is not None and ga_results_all[sim_index] is not None:
+            ga_b = ga_results_all[sim_index]['best']
+            if 'radius' in ga_b:
+                best_radius_GA = ga_b['radius']
+            else:
+                ri = gnt.get_radius_intervals_from_kband(ga_results_all[sim_index],ga_kband_all[sim_index], kband_unc=kband_unc)
+                best_radius_GA = ri['best']
+            best_theta_GA = []
+            for name in PARAM_NAMES:
+                if name == 'radius':
+                    best_theta_GA.append(best_radius_GA)
+                else:
+                    ga_col = GA_NAME_MAP.get(name)
+                    best_theta_GA.append(ga_b[ga_col] if ga_col else 0.0)
+            best_theta_GA = np.array(best_theta_GA)
+            ga_flux = simulate_model_spectrum(best_theta_GA, broadening_method=broadening_method, emulator=emulator, limbdark=0.6, output_wl=obs_wl)
+            ax_spec.plot(obs_wl, ga_flux, lw=1, label='Best fit GA', color='darkorange')
+
+        if nested_sampling_results_all is not None and nested_sampling_results_all[sim_index] is not None:
+            ns_flux = simulate_model_spectrum(nested_sampling_results_all[sim_index]['theta_50p'], broadening_method=broadening_method, emulator=emulator, limbdark=0.6, output_wl=obs_wl)
+            ax_spec.plot(obs_wl, ns_flux, lw=1, label='Best fit NS (median)', color='green')
+
+        ax_spec.set_xlabel('Wavelength (nm)')
+        ax_spec.set_ylabel('Flux')
+        ax_spec.set_title(f'Observed spectrum — simulation {sim_index}')
+        ax_spec.legend()
+        plt.tight_layout()
+        plt.show()
+        return fig_spec, ax_spec
+    else:
+        return None, None
+
+def plot_bias_vs_true(theta_true_all, mcmc_results_all, ga_results_all, kband_all, kband_unc, ns_results_all):
+    n_params = len(PARAM_NAMES)
+    n_cols = 3
+    n_rows = int(np.ceil(n_params / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(14 * n_cols / 3, 8 * n_rows / 2))
+    axes = axes.flatten()
+
+    for j, name in enumerate(PARAM_NAMES):
+        ax = axes[j]
+        ax.axhline(0, color='grey', lw=1, linestyle='--')
+
+        # MCMC: use theta_50p as the point estimate
+        mcmc_bias = [r["theta_50p"][j] - theta_true_all[i, j] for i, r in enumerate(mcmc_results_all) if r is not None]
+        mcmc_true = [theta_true_all[i, j] for i, r in enumerate(mcmc_results_all) if r is not None]
+        ax.scatter(mcmc_true, mcmc_bias, label='MCMC median', alpha=0.7, marker='o')
+
+        # GA: use best-fit value
+        ga_bias, ga_true = [], []
+        for i, r in enumerate(ga_results_all):
+            if r is None: continue
+            if name == "radius":
+                ri = gnt.get_radius_intervals_from_kband(r, kband_all[i], kband_unc=kband_unc)
+                best = ri["best"]
+            else:
+                ga_name = GA_NAME_MAP.get(name)
+                best = r["best"].get(ga_name) if ga_name else None
+            if best is not None:
+                ga_bias.append(best - theta_true_all[i, j])
+                ga_true.append(theta_true_all[i, j])
+        ax.scatter(ga_true, ga_bias, label='GA best fit', alpha=0.7, marker='D')
+
+        # NS bias
+        if ns_results_all is not None:
+            ns_bias, ns_true = [], []
+            for i, r in enumerate(ns_results_all):
+                if r is None: continue
+                ns_bias.append(r["theta_50p"][j] - theta_true_all[i, j])
+                ns_true.append(theta_true_all[i, j])
+            ax.scatter(ns_true, ns_bias, label='NS median', alpha=0.7, marker='^', color='green')
+
+        ax.set_xlabel(f'true {name}')
+        ax.set_ylabel('bias (recovered − true)')
+        ax.set_title(name)
+        if j == 0:
+            ax.legend()
+    fig.suptitle(f"Bias vs. true value for MCMC, GA and NS — {len(mcmc_results_all)} simulations", fontsize=13, y=1.01)
+    plt.tight_layout()
+    plt.show()
+
+def print_comparison_summary(
+    theta_true_all,
+    mcmc_results_all,
+    ga_results_all,
+    kband_all,
+    kband_unc,
+    mcmc_credible_dict,
+    ga_coverage_dicts,
+    mcmc_runtime_all=None,
+    ga_runtime_all=None,
+    ns_results_all=None,
+    ns_credible_dict=None,
+    ns_runtime_all=None,
+    param_names=None,
+    ga_name_map=None,
+):
+    """
+    Print a summary table comparing MCMC, GA, and NS performance across all simulations.
+
+    For each parameter, reports:
+        - Median bias      : median(recovered - true)
+        - RMS scatter      : RMS of (recovered - true)
+        - 1sigma coverage  : fraction of simulations where true value falls within 1sigma interval
+        - 2sigma coverage  : fraction of simulations where true value falls within 2sigma interval
+    Plus a final row with median runtime per simulation.
+
+    Parameters
+    ----------
+    theta_true_all : np.ndarray, shape (N_sims, n_params)
+        True parameter values for each simulation.
+    mcmc_results_all : list of dicts
+        Output of run_MCMC_coverage_test — one result dict per simulation.
+    ga_results_all : list of dicts
+        Output of run_ga_coverage_test — one result dict per simulation.
+    kband_all : list of floats
+        Observed K-band magnitude for each simulation (needed for GA radius).
+    mcmc_credible_dict : dict
+        {param_name: [credible_rank_per_sim]} from run_MCMC_coverage_test.
+    ga_coverage_dicts : list of dicts
+        Per-simulation coverage dicts from run_ga_coverage_test.
+    mcmc_runtime_all : list of floats or None
+        Wall-clock runtime in seconds for each MCMC simulation.
+    ga_runtime_all : list of floats or None
+        Wall-clock runtime in seconds for each GA simulation.
+    ns_results_all : list of dicts or None
+        Output of run_NS_coverage_test — one result dict per simulation.
+    ns_credible_dict : dict or None
+        {param_name: [credible_rank_per_sim]} from run_NS_coverage_test.
+    ns_runtime_all : list of floats or None
+        Wall-clock runtime in seconds for each NS simulation.
+    param_names : list of str or None
+        Parameter names to include. Defaults to PARAM_NAMES.
+    ga_name_map : dict or None
+        Mapping from PARAM_NAMES to GA column names, e.g. {"teff": "Teff"}.
+        Defaults to identity mapping.
+    """
+    param_names = param_names or PARAM_NAMES
+    ga_name_map = ga_name_map or {n: n for n in param_names}
+    use_ns      = ns_results_all is not None and ns_credible_dict is not None
+
+    col_w  = 14   # width per method column
+    n_meth = 3 if use_ns else 2
+
+    # --- header rows ---
+    def make_sep():
+        return "+" + "-"*14 + ("+" + "-"*col_w*n_meth)*4 + "+"
+
+    def make_col_hdr():
+        return (
+            f"{'Parameter':<14}|"
+            f"{'Median bias':>{col_w*n_meth}}|"
+            f"{'RMS scatter':>{col_w*n_meth}}|"
+            f"{'1σ coverage':>{col_w*n_meth}}|"
+            f"{'2σ coverage':>{col_w*n_meth}}|"
+        )
+
+    def make_method_hdr():
+        methods = f"{'MCMC':>{col_w}}{'GA':>{col_w}}" + (f"{'NS':>{col_w}}" if use_ns else "")
+        return f"{'':14}|{methods}|{methods}|{methods}|{methods}|"
+
+    sep = make_sep()
+    print(sep)
+    print(make_col_hdr())
+    print(make_method_hdr())
+    print(sep)
+
+    for j, name in enumerate(param_names):
+
+        # --- MCMC ---
+        mcmc_best  = np.array([r["theta_50p"][j] for r in mcmc_results_all if r is not None])
+        true_vals  = theta_true_all[:len(mcmc_best), j]
+        mcmc_bias  = mcmc_best - true_vals
+        mcmc_med_b = np.median(mcmc_bias)
+        mcmc_rms   = np.sqrt(np.mean(mcmc_bias**2))
+        mcmc_ranks = np.array(mcmc_credible_dict[name])
+        mcmc_1sig  = np.mean((mcmc_ranks >= 0.159) & (mcmc_ranks <= 0.841))
+        mcmc_2sig  = np.mean((mcmc_ranks >= 0.023) & (mcmc_ranks <= 0.977))
+
+        # --- GA ---
+        ga_best_vals, ga_true_vals = [], []
+        ga_1sig_count, ga_2sig_count, ga_n = 0, 0, 0
+        for k, r in enumerate(ga_results_all):
+            if r is None:
+                continue
+            if name == "radius":
+                ri   = gnt.get_radius_intervals_from_kband(r, kband_all[k], kband_unc=kband_unc)
+                best = ri["best"]
+                lo1, hi1 = ri["lower_1sig"], ri["upper_1sig"]
+                lo2, hi2 = ri["lower_2sig"], ri["upper_2sig"]
+            else:
+                ga_col = ga_name_map.get(name, name)
+                if ga_col not in r["best"]:
+                    continue
+                best = r["best"][ga_col]
+                lo1, hi1 = r["lower_1sig"][ga_col], r["upper_1sig"][ga_col]
+                lo2, hi2 = r["lower_2sig"][ga_col], r["upper_2sig"][ga_col]
+            truth = theta_true_all[k, j]
+            ga_best_vals.append(best)
+            ga_true_vals.append(truth)
+            ga_1sig_count += int(lo1 <= truth <= hi1)
+            ga_2sig_count += int(lo2 <= truth <= hi2)
+            ga_n += 1
+
+        if ga_n > 0:
+            ga_bias  = np.array(ga_best_vals) - np.array(ga_true_vals)
+            ga_med_b = np.median(ga_bias)
+            ga_rms   = np.sqrt(np.mean(ga_bias**2))
+            ga_1sig  = ga_1sig_count / ga_n
+            ga_2sig  = ga_2sig_count / ga_n
+        else:
+            ga_med_b = ga_rms = ga_1sig = ga_2sig = float("nan")
+
+        # --- NS ---
+        if use_ns:
+            ns_best  = np.array([r["theta_50p"][j] for r in ns_results_all if r is not None])
+            ns_true  = theta_true_all[:len(ns_best), j]
+            ns_bias  = ns_best - ns_true
+            ns_med_b = np.median(ns_bias)
+            ns_rms   = np.sqrt(np.mean(ns_bias**2))
+            ns_ranks = np.array(ns_credible_dict[name])
+            ns_1sig  = np.mean((ns_ranks >= 0.159) & (ns_ranks <= 0.841))
+            ns_2sig  = np.mean((ns_ranks >= 0.023) & (ns_ranks <= 0.977))
+            ns_cols  = f"{ns_med_b:>{col_w}.4f}{ns_rms:>{col_w}.4f}{ns_1sig:>{col_w}.3f}{ns_2sig:>{col_w}.3f}"
+        else:
+            ns_cols = ""
+
+        # --- print row ---
+        # build each section then join with |
+        bias_sec = f"{mcmc_med_b:>{col_w}.4f}{ga_med_b:>{col_w}.4f}" + (f"{ns_med_b:>{col_w}.4f}" if use_ns else "")
+        rms_sec  = f"{mcmc_rms:>{col_w}.4f}{ga_rms:>{col_w}.4f}"     + (f"{ns_rms:>{col_w}.4f}"   if use_ns else "")
+        s1_sec   = f"{mcmc_1sig:>{col_w}.3f}{ga_1sig:>{col_w}.3f}"   + (f"{ns_1sig:>{col_w}.3f}"  if use_ns else "")
+        s2_sec   = f"{mcmc_2sig:>{col_w}.3f}{ga_2sig:>{col_w}.3f}"   + (f"{ns_2sig:>{col_w}.3f}"  if use_ns else "")
+        print(f"{name:<14}|{bias_sec}|{rms_sec}|{s1_sec}|{s2_sec}|")
+
+    print(sep)
+
+    # --- Runtime row ---
+    mcmc_rt = f"{np.median(mcmc_runtime_all)/60:.1f} min" if mcmc_runtime_all else "N/A"
+    ga_rt   = f"{np.median(ga_runtime_all)/60:.1f} min"   if ga_runtime_all   else "N/A"
+    ns_rt   = f"{np.median(ns_runtime_all)/60:.1f} min"   if ns_runtime_all   else "N/A"
+
+    rt_sec  = f"{mcmc_rt:>{col_w}}{ga_rt:>{col_w}}" + (f"{ns_rt:>{col_w}}" if use_ns else "")
+    blank   = f"{'':>{col_w}}{'':>{col_w}}"          + (f"{'':>{col_w}}"    if use_ns else "")
+    print(f"{'Runtime (med)':<14}|{rt_sec}|{blank}|{blank}|{blank}|")
+    print(sep)
