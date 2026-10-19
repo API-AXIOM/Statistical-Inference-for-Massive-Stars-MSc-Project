@@ -1,0 +1,94 @@
+{
+  "_comment": [
+    "Informative priors and the distribution of realistic stars used as coverage-test truths.",
+    "",
+    "The emulators were trained at LMC metallicity, so every star is an LMC star: the",
+    "'lmc' block sets the metallicity, the abundance baselines, helium and the coefficients of",
+    "the wind relations; the 'relations' block switches each relation on or off.",
+    "Abundance baselines are the unprocessed values; CNO processing then moves N up and C, O",
+    "down, so each abundance prior is one-sided, with its cut shifted past the baseline by",
+    "'baseline_margin'.",
+    "",
+    "Sources used:",
+    "  Vink et al. (2023), X-Shooting ULLYSES I, table 1: CNO baseline abundances.",
+    "  Martins et al. (2024, A&A 689, A31), table 1: helium prior and the abundance margins.",
+    "  Hawcroft et al. (2024, A&A 688, A105): v_inf(T_eff) and v_inf(v_esc) relations.",
+    "  Bjorklund et al. (2023, A&A 676, A109): mass-loss recipe.",
+    "  Keszthelyi et al. (2025): upper mass bound (R136a1).",
+    "  Bestenlehner et al. (2025, A&A 695, A198): vsini distribution of the simulated stars.",
+    "  Brands et al. (2022, A&A 663, A36): Eddington cap of the simulated stars.",
+    "",
+    "CAUTION: several of these numbers come from rough calculations (for example the",
+    "distribution shapes fitted by eye to a few summary values) and have not been verified,",
+    "and the informative priors have not been tested in fits. Check everything against the",
+    "sources before using these priors for science."
+  ],
+  "lmc": {
+    "metallicity": 0.5,
+    "abundances": {
+      "C": 8.01,
+      "N": 7.03,
+      "O": 8.40,
+      "_note": "LMC baseline abundances, 12 + log(X/H), from table 1 in X-Shooting ULLYSES: Massive stars at low metallicity I. Project description by Vink et al. 2023. The prior is flat on the processed side of each cut (N above, C and O below) and zero on the other side. The cuts sit at the baseline shifted by 'baseline_margin' towards the unprocessed side."
+    },
+    "baseline_margin": {
+      "C": 0.15,
+      "N": 0.15,
+      "O": 0.15,
+      "_note": "Margin in dex by which each abundance cut is moved past its baseline (C and O up, N down), giving C <= 8.16, N >= 6.88 and O <= 8.55. The exact baseline values are not used as cuts, to allow for measurement scatter and because stars are not all born with the same composition: some are a little richer or poorer than the LMC average. 0.15 dex covers every LMC O star in table 1 of Martins et al. (2024, A&A 689, A31), the highest being Sk-66 171 at C = 8.13 and O = 8.46; all of them have N above the baseline."
+    },
+    "yhe": {
+      "centre": 0.09,
+      "width": 0.035,
+      "low": 0.08,
+      "_note": "He/H by number. Gaussian centred near the unprocessed value with width 0.035, truncated to [low, upper bound]: helium only increases with processing, so most weight sits near the bottom of the range with a tail to higher values. As for the CNO abundances, the cut at 0.08 lies a little below the unprocessed value 0.085 to allow for measurement scatter and stars born slightly helium-poorer. Matches the 17 LMC O stars in table 1 of Martins et al. (2024, A&A 689, A31): none below 0.085, median 0.10, 29% at or above 0.12, 12% at or above 0.14 (the prior gives median 0.108, 32% and 12%)."
+    },
+    "vinf_teff": {
+      "a": 8.8,
+      "a_err": 0.4,
+      "b": 1200,
+      "b_err": 150,
+      "rms": 312,
+      "_note": "v_inf = a * (T_eff / 100 K) - b, in km/s (Hawcroft et al. 2024, A&A 688, A105). The prior is a Gaussian around this line with width rms, the scatter of the stars about the fit. a_err and b_err are the fit uncertainties of the coefficients, kept for reference; the prior does not use them."
+    },
+    "vinf_vesc": {
+      "a": 3.0,
+      "a_err": 0.2,
+      "b": 470,
+      "b_err": 150,
+      "rms": 351,
+      "_note": "v_inf = a * v_esc - b, in km/s (Hawcroft et al. 2024, A&A 688, A105). The prior is a Gaussian around this line with width rms, the scatter of the stars about the fit. a_err and b_err are the fit uncertainties of the coefficients, kept for reference; the prior does not use them."
+    }
+  },
+  "relations": {
+    "mass": {
+      "use": true,
+      "low": 8.0,
+      "high": 291.0,
+      "_note": "Top-hat physicality constraint on the derived current spectroscopic mass, M_spec = g R^2 / G. Upper limit based on R136a1 in the LMC, the most massive star known (Keszthelyi et al. 2025)."
+    },
+    "vinf_teff": {
+      "use": true,
+      "_note": "v_inf(T_eff) relation, coefficients in the 'lmc' block (Hawcroft et al. 2024). Set use to false to disable it."
+    },
+    "vinf_vesc": {
+      "use": false,
+      "_note": "v_inf(v_esc) relation, coefficients in the 'lmc' block (Hawcroft et al. 2024). Off for three reasons. (1) Its stars overlap with those behind vinf_teff, so the two relations are not independent; switch on one at a time. (2) Hawcroft et al. conclude that T_eff rather than v_esc should be used to predict v_inf, because stellar masses and radii are less certain than temperatures. (3) Their v_esc uses evolutionary masses and radii, whereas this prior computes v_esc from the spectroscopic mass g R^2 / G, and the two masses can differ substantially for O stars. Override with informative_prior(..., use_vinf_vesc=True)."
+    },
+    "mass_loss": {
+      "use": false,
+      "centre": 0.0,
+      "width": 0.5,
+      "_note": "Gaussian on log mdot minus the Bjorklund, Sundqvist, Singh, Puls & Najarro (2023, A&A 676, A109) recipe, which has the metallicity dependence built in. Off by default: the sampled parameter box extends well outside the recipe's calibrated range, so whether this relation helps or hurts recovery is still an open question. Override with informative_prior(..., use_mass_loss=True). centre is the expected offset of log mdot from the recipe and width the scatter around it, both in dex; centre = 0 is a placeholder, not a value checked against LMC stars."
+    }
+  },
+  "realistic_truths": {
+    "eddington_cap": 1.0,
+    "rotation": {
+      "mean": 121.0,
+      "sd": 61.0,
+      "_note": "vsini is drawn from a gamma distribution with this mean and standard deviation, truncated to the vsini bounds. Bestenlehner et al. (2025, A&A 695, A198) give v_e sin i = 121 +- 61 km/s for LMC O stars, with about 10% of OB stars at or above 200 km/s and 1% at or above 300 km/s; this gamma distribution gives 10.6% and 1.2%."
+    },
+    "_note": "Distribution of true parameters for simulated spectra of realistic stars. It is the 'lmc' informative prior (abundances, helium, mass bounds, v_inf relations) with the Bjorklund mass-loss relation switched on, the rotation distribution above for vsini, and Gamma_e (electron scattering, Thomson opacity) capped at eddington_cap. Every other parameter is uniform over the box. eddington_cap = 1 is the cutoff of the Eddington-limit check in Kiwi-GA (Brands et al. 2022, A&A, 663, A36); here it is applied to Gamma_e computed with the Thomson opacity above, so it rejects every star above the Eddington limit."
+  }
+}

@@ -1,0 +1,10 @@
+torch>=2.4
+numpy>=1.26
+scipy>=1.11
+emcee>=3.1
+h5py>=3.10
+tqdm>=4.66
+matplotlib>=3.8
+corner>=2.2
+astropy>=6.0
+ultranest>=4.1

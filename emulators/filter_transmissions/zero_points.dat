@@ -1,3 +1,5 @@
+# Zero-point flux densities f_lambda in erg s^-1 cm^-2 A^-1, per band, for the
+# Vega, AB and ST systems. Taken from Kiwi-GA (Brands et al. 2022, A&A 663, A36).
 # band vega AB ST
 SPHERE_Ks 4.182e-11 2.313e-10 3.631e-9
 HST_555w 3.830e-9 3.837e-9 3.631e-9

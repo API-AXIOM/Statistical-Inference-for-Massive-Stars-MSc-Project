@@ -1,33 +1,28 @@
-# macOS
-.DS_Store
+# Trained emulator files: available from the emulators' author, not part of
+# this repository (see emulators/README.md)
+emulators/line_emulators_13par/models/
+emulators/fluxcont/model/
+*.pth
 
-# Editor/IDE
-.vscode/
+# Environment, run output and logs
+venv/
+.venv/
+results/
+logs/
+slurm-*.out
+
+# Spectra and quick-look plots kept in the repository folder itself
+/*.png
+/*.fits
+/*.npz
+
+# Python and editor clutter
 __pycache__/
-
-# Archives / large files
-*.zip
-*.tar
-*.tar.gz
-
-# Local data / heavy outputs (adjust as needed)
-FASTWIND_spectra/
-MCMC_results/
-emulators_per_line_hg/
-nested_sampling_results/
-ns_results_vasilis_hg_spectrum_only_smoke/
-
-# Jupyter checkpoints
+*.pyc
 .ipynb_checkpoints/
+.DS_Store
+*.swp
+.vscode/
 
-# Ignore Jupyter notebooks (keep only scripts in repo)
-*.ipynb
-
-# Ignore images and other heavy binary outputs
-*.png
-*.jpg
-*.jpeg
-
-# Ignore local/demo folders / heavy data
-KIWI-GA/
-Vasilisemulator*.ipynb
+# Personal notes, not part of the repository
+GITHUB_UPLOAD_GUIDE.md

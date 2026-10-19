@@ -1,0 +1,84 @@
+{
+  "_comment": [
+    "Wavelength grids used to SIMULATE observations (--mock). With --data the",
+    "wavelengths come from your file and only 'resolution' is read from here;",
+    "override it with --resolution.",
+    "",
+    "Each segment is [lambda_min_angstrom, lambda_max_angstrom, step].",
+    "'sampling' says what the step means: 'wavelength' (default) makes it a",
+    "spacing in Angstrom; 'velocity' makes it a step in km/s, giving a grid",
+    "evenly spaced in velocity.",
+    "",
+    "Only points inside a line-emulator window contribute residuals, so",
+    "segments outside those windows do not enter the likelihood.",
+    "",
+    "'resolution' is a single resolving power for one entry. Real instruments",
+    "whose arms differ in R (X-Shooter) need one entry per arm; naming more",
+    "than one entry on the command line (--instrument name1 name2 ...)",
+    "combines them into a single fit, with each line broadened at whichever",
+    "named instrument's wavelength range covers it. Combined instruments'",
+    "segments must not overlap, and no line window may straddle the boundary",
+    "between two of them -- move the boundary if one does."
+  ],
+
+  "dense": {
+    "description": "Dense uniform-wavelength mock grid spanning every emulator's full predictable range (min(lambda_min) to max(lambda_max) across all 37 line emulators -- CIV1169b sets the blue edge at 800 A, HEI7065 the red edge at 7190 A); a numerical grid, not an observational setup.",
+    "resolution": 10000, 
+    "segments": [[800.0, 7190.0, 0.033]],
+    "_note": "A constant 0.033 A step is a varying velocity step: about 12.4 km/s at 800 A, 2.5 km/s at 4000 A, 1.4 km/s at 7190 A. Still oversampled for R = 10000 throughout (pixel step stays below the ~30 km/s resolution element even at the blue edge, just with less margin than in the middle of the range). About 1.9e5 points."
+  },
+
+  "Martins2017_stars_uv": {
+    "description": "Realistic wavelengths and resolution to create the spectra from stars from Martins 2017; UV segment.",
+    "resolution": 1500,
+    "segments": [[800.0, 3400.0, 0.033]],
+    "_note": "One arm of the Martins2017_stars setup; use together with Martins2017_stars_opt (--instrument Martins2017_stars_uv Martins2017_stars_opt) to fit or simulate the full UV+optical spectrum in one run, split at 3400 A."
+  },
+
+  "Martins2017_stars_opt": {
+    "description": "Realistic wavelengths and resolution to create the spectra from stars from Martins 2017; optical segment.",
+    "resolution": 8000,
+    "segments": [[3400.0, 7190.0, 0.033]],
+    "_note": "One arm of the Martins2017_stars setup; use together with Martins2017_stars_uv (--instrument Martins2017_stars_uv Martins2017_stars_opt) to fit or simulate the full UV+optical spectrum in one run, split at 3400 A."
+  },
+
+  "LMC_stars_R17500": {
+    "description": "Far-UV segment of the LMC O-star spectra (Sk -66 171, Sk -69 50), R = 17500; holds the PV 1118 line.",
+    "resolution": 17500,
+    "segments": [[1000.0, 1150.0, 3.5]],
+    "sampling": "velocity",
+    "_note": "Resolving powers of the five LMC segments are those listed per line in each star's own line_list.txt. The 3.5 km/s step is the median velocity sampling of the observed spectra. With --data the wavelengths come from the file and only the resolving power and wavelength range are used. Use all five LMC_stars_* entries together."
+  },
+
+  "LMC_stars_R45800": {
+    "description": "Far-UV segment of the LMC O-star spectra, R = 45800; holds the lines from CIV 1169 to CIV 1550.",
+    "resolution": 45800,
+    "segments": [[1150.0, 1600.0, 4.1]],
+    "sampling": "velocity",
+    "_note": "See LMC_stars_R17500."
+  },
+
+  "LMC_stars_R30000": {
+    "description": "Mid-UV segment of the LMC O-star spectra, R = 30000; holds NIV 1718 and NIII 1750.",
+    "resolution": 30000,
+    "segments": [[1600.0, 3000.0, 6.5]],
+    "sampling": "velocity",
+    "_note": "See LMC_stars_R17500."
+  },
+
+  "LMC_stars_R6700": {
+    "description": "Blue optical segment of the LMC O-star spectra, R = 6700; holds NIV 3480 through HeII 5411.",
+    "resolution": 6700,
+    "segments": [[3000.0, 5500.0, 13.3]],
+    "sampling": "velocity",
+    "_note": "See LMC_stars_R17500."
+  },
+
+  "LMC_stars_R11400": {
+    "description": "Red optical segment of the LMC O-star spectra, R = 11400; holds OIII 5592 through HeI 7065.",
+    "resolution": 11400,
+    "segments": [[5500.0, 7300.0, 9.2]],
+    "sampling": "velocity",
+    "_note": "See LMC_stars_R17500."
+  }
+}
