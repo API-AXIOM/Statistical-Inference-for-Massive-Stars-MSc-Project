@@ -123,8 +123,6 @@ your spectrum before fitting; `inspect_spectrum.py` lists them.
 
 ## How it is fast
 
-Four things, none of which changes the answer.
-
 **The emulator's wavelength half is computed once.** A DeepONet predicts
 `flux = sum_l trunk(lambda)[l] * branch(theta)[l]`. The trunk runs once per
 wavelength point and the branch once per parameter vector, so the trunk is the
