@@ -211,6 +211,102 @@ class HardBoundsRelation:
         return result
 
 
+class ZamsRelation:
+    """A lower limit on luminosity at the zero-age main sequence (ZAMS), with
+    stars becoming rarer further above it.
+
+    ``teff`` and ``log_luminosity`` give points on the ZAMS. Only the branch
+    on which Teff rises with luminosity is used, up to the hottest point;
+    beyond it the ZAMS of the most massive models turns back to cooler Teff,
+    above the branch used, so this branch is the lower edge at every Teff.
+    For a star at height ``delta = log L - log L_ZAMS(Teff)`` above the ZAMS,
+    the log density is ``-delta / scale`` for ``delta >= 0`` and ``-inf``
+    below the ZAMS or at Teff hotter than any ZAMS point. It peaks at zero,
+    which keeps rejection sampling in ``Prior.sample`` exact.
+    """
+
+    def __init__(self, name, teff, log_luminosity, scale, description=""):
+        teff = np.asarray(teff, dtype=np.float64)
+        log_luminosity = np.asarray(log_luminosity, dtype=np.float64)
+        order = np.argsort(log_luminosity)
+        teff, log_luminosity = teff[order], log_luminosity[order]
+        hottest = np.argmax(teff)
+        self.log_teff = np.log10(teff[:hottest + 1])
+        self.log_luminosity = log_luminosity[:hottest + 1]
+        if np.any(np.diff(self.log_teff) <= 0):
+            raise ValueError(f"{name}: Teff must rise with luminosity up to "
+                             f"the hottest ZAMS point")
+        self.name = name
+        self.scale = float(scale)
+        self.description = description
+
+    def height(self, derived):
+        """log L above the ZAMS at the star's Teff (+inf hotter than the ZAMS)."""
+        zams = np.interp(np.log10(derived["teff"]), self.log_teff,
+                         self.log_luminosity, right=np.inf)
+        return derived["log_luminosity"] - zams
+
+    def log_prob(self, derived):
+        delta = self.height(derived)
+        return np.where(delta >= 0, -delta / self.scale, -np.inf)
+
+    def describe(self):
+        result = (f"{self.name}: log L >= ZAMS for Teff <= "
+                  f"{10 ** self.log_teff[-1]:.0f} K, falling as "
+                  f"exp(-(log L - log L_ZAMS) / {self.scale:.4g})")
+        if self.description:
+            result += f"  ({self.description})"
+        return result
+
+
+class MassLuminosityRelation:
+    """A lower limit on luminosity at the ZAMS luminosity of a star's mass.
+
+    A star is faintest on the ZAMS and brightens as it evolves, so a star of
+    mass M should be at least as luminous as a ZAMS star of mass M. ``mass``
+    and ``log_luminosity`` give points on the ZAMS; the limit is interpolated
+    linearly in log M. The log density is zero for ``log L >= log L_ZAMS(M)``
+    and ``-inf`` below it or outside the masses of the ZAMS points. Here M is
+    the spectroscopic mass g R^2 / G, so the limit ties log g, radius and
+    Teff together.
+    """
+
+    def __init__(self, name, mass, log_luminosity, description=""):
+        mass = np.asarray(mass, dtype=np.float64)
+        order = np.argsort(mass)
+        self.log_mass = np.log10(mass[order])
+        self.log_luminosity = np.asarray(log_luminosity, dtype=np.float64)[order]
+        if np.any(np.diff(self.log_luminosity) <= 0):
+            raise ValueError(f"{name}: the ZAMS log L must rise with mass")
+        self.name = name
+        self.description = description
+
+    def height(self, derived):
+        """log L above the ZAMS log L of the star's mass (-inf outside the
+        masses of the ZAMS points)."""
+        zams = np.interp(np.log10(derived["mass"]), self.log_mass,
+                         self.log_luminosity, left=np.inf, right=np.inf)
+        return derived["log_luminosity"] - zams
+
+    def log_prob(self, derived):
+        return np.where(self.height(derived) >= 0, 0.0, -np.inf)
+
+    def describe(self):
+        result = (f"{self.name}: log L >= log L_ZAMS(M) for "
+                  f"{10 ** self.log_mass[0]:.0f}-{10 ** self.log_mass[-1]:.0f} Msun")
+        if self.description:
+            result += f"  ({self.description})"
+        return result
+
+
+def load_zams(path):
+    """Initial mass [Msun], Teff [K] and log L [Lsun] of the ZAMS points in
+    ``path`` (columns: initial mass, Teff, log L, ...; ``#`` starts a
+    comment)."""
+    table = np.loadtxt(path, usecols=(0, 1, 2), comments="#")
+    return table[:, 0], table[:, 1], table[:, 2]
+
+
 def _wind_relation_coefficients(config, key):
     """Slope ``a``, intercept ``b`` and scatter ``rms`` of a v_inf relation."""
     block = config.get("lmc", {}).get(key, {})
@@ -486,10 +582,15 @@ def realistic_truths(config=None):
     It is the informative prior with the Bjorklund et al. (2023) mass-loss
     relation switched on, vsini drawn from a truncated gamma distribution
     with the mean and standard deviation observed for LMC O stars, and the
-    electron-scattering Eddington factor Gamma_e capped (both set in the
-    ``realistic_truths`` block of the prior config). Teff, log g, radius,
+    electron-scattering Eddington factor Gamma_e capped, and no star below
+    the LMC zero-age main sequence, with stars becoming exponentially rarer
+    with height in log L above it (``ZamsRelation``), and no star fainter
+    than a ZAMS star of its own spectroscopic mass
+    (``MassLuminosityRelation``; all set in the ``realistic_truths`` block
+    of the prior config). Teff, log g, radius,
     beta, the clumping parameters and vmacro stay uniform over the box; the
-    mass bounds and the terminal-velocity relations act on their combinations.
+    mass bounds, the ZAMS and the terminal-velocity relations act on their
+    combinations.
 
     Only ``sample`` is meant to be used: the distribution describes which
     stars to simulate, not what a fit should assume.
@@ -506,5 +607,14 @@ def realistic_truths(config=None):
     prior.relations.append(HardBoundsRelation(
         "Gamma_e", lambda d: d["eddington"], 0.0, block["eddington_cap"],
         "electron-scattering Eddington factor"))
+    zams = block["zams"]
+    mass, teff, log_luminosity = load_zams(
+        os.path.join(os.path.dirname(DEFAULT_PRIOR_CONFIG), zams["file"]))
+    source = "non-rotating LMC models of Brott et al. 2011 and Koehler et al. 2015"
+    prior.relations.append(ZamsRelation(
+        "ZAMS", teff, log_luminosity, zams["scale"], source))
+    if zams["mass_luminosity"]:
+        prior.relations.append(MassLuminosityRelation(
+            "ZAMS mass-luminosity", mass, log_luminosity, source))
     prior.name = "realistic-LMC"
     return prior

@@ -17,6 +17,9 @@
     "  Keszthelyi et al. (2025): upper mass bound (R136a1).",
     "  Bestenlehner et al. (2025, A&A 695, A198): vsini distribution of the simulated stars.",
     "  Brands et al. (2022, A&A 663, A36): Eddington cap of the simulated stars.",
+    "  Brott et al. (2011, A&A 530, A115) and Koehler et al. (2015, A&A 573, A71): ZAMS of",
+    "    the non-rotating LMC tracks (CDS catalogues J/A+A/530/A115, J/A+A/573/A71), the",
+    "    lower luminosity limit of the simulated stars (config/zams_lmc.txt).",
     "",
     "CAUTION: several of these numbers come from rough calculations (for example the",
     "distribution shapes fitted by eye to a few summary values) and have not been verified,",
@@ -48,8 +51,8 @@
       "a_err": 0.4,
       "b": 1200,
       "b_err": 150,
-      "rms": 312,
-      "_note": "v_inf = a * (T_eff / 100 K) - b, in km/s (Hawcroft et al. 2024, A&A 688, A105). The prior is a Gaussian around this line with width rms, the scatter of the stars about the fit. a_err and b_err are the fit uncertainties of the coefficients, kept for reference; the prior does not use them."
+      "rms": 500,
+      "_note": "v_inf = a * (T_eff / 100 K) - b, in km/s (Hawcroft et al. 2024, A&A 688, A105). The prior is a Gaussian around this line with width rms, the scatter of the stars about the fit. a_err and b_err are the fit uncertainties of the coefficients, kept for reference; the prior does not use them. Hawcroft et al. find a scatter of 312 km/s; rms is set to 500 km/s to allow for stars that lie further from the relation than those in their sample."
     },
     "vinf_vesc": {
       "a": 3.0,
@@ -78,17 +81,23 @@
     "mass_loss": {
       "use": false,
       "centre": 0.0,
-      "width": 0.5,
-      "_note": "Gaussian on log mdot minus the Bjorklund, Sundqvist, Singh, Puls & Najarro (2023, A&A 676, A109) recipe, which has the metallicity dependence built in. Off by default: the sampled parameter box extends well outside the recipe's calibrated range, so whether this relation helps or hurts recovery is still an open question. Override with informative_prior(..., use_mass_loss=True). centre is the expected offset of log mdot from the recipe and width the scatter around it, both in dex; centre = 0 is a placeholder, not a value checked against LMC stars."
+      "width": 0.4,
+      "_note": "Gaussian on log mdot minus the Bjorklund, Sundqvist, Singh, Puls & Najarro (2023, A&A 676, A109) recipe, which has the metallicity dependence built in. Off by default: the sampled parameter box extends well outside the recipe's calibrated range, so whether this relation helps or hurts recovery is still an open question. Override with informative_prior(..., use_mass_loss=True). centre is the expected offset of log mdot from the recipe and width the scatter around it, both in dex; centre = 0 is a placeholder, not a value checked against LMC stars. The accuracy of the recipe itself is 0.18 dex: Bjorklund et al. (2023) find almost 90% of their grid models within a factor of 2 (0.30 dex) of the fitting formula, which for a Gaussian is a standard deviation of 0.30 / 1.645 = 0.18 dex. width = 0.4 dex widens this to allow for real stars lying further from the models than the grid does."
     }
   },
   "realistic_truths": {
     "eddington_cap": 1.0,
+    "zams": {
+      "file": "zams_lmc.txt",
+      "scale": 0.2,
+      "mass_luminosity": true,
+      "_note": "Lower limit on luminosity at the zero-age main sequence (ZAMS) of the non-rotating LMC models of Brott et al. (2011, A&A 530, A115; 5-60 Msun) and Koehler et al. (2015, A&A 573, A71; 80-500 Msun): the first model of each track, from their CDS catalogues, listed in 'zams_lmc.txt' (relative to this config's folder). A star is rejected below the ZAMS log L at its Teff, and kept with probability exp(-(log L - log L_ZAMS) / scale) above it. scale = 0.2 dex is a chosen value, not one taken from the literature; with an exponential, 1 - exp(-1) = 63% of stars lie within one scale (0.2 dex) of the ZAMS and 95% within three (0.6 dex), before the other relations and the parameter box act, which push stars further up. Below about 37 kK the ZAMS radius is under the 5 Rsun lower radius bound, so cooler stars cannot lie on the ZAMS itself. With mass_luminosity true, a star is also rejected if it is fainter than a ZAMS star of its own spectroscopic mass M = g R^2 / G (log L < log L_ZAMS(M), interpolated in log M over the same points): a star is faintest on the ZAMS and brightens as it evolves. This ties log g to Teff and radius, which the limit at fixed Teff alone does not."
+    },
     "rotation": {
       "mean": 121.0,
       "sd": 61.0,
       "_note": "vsini is drawn from a gamma distribution with this mean and standard deviation, truncated to the vsini bounds. Bestenlehner et al. (2025, A&A 695, A198) give v_e sin i = 121 +- 61 km/s for LMC O stars, with about 10% of OB stars at or above 200 km/s and 1% at or above 300 km/s; this gamma distribution gives 10.6% and 1.2%."
     },
-    "_note": "Distribution of true parameters for simulated spectra of realistic stars. It is the 'lmc' informative prior (abundances, helium, mass bounds, v_inf relations) with the Bjorklund mass-loss relation switched on, the rotation distribution above for vsini, and Gamma_e (electron scattering, Thomson opacity) capped at eddington_cap. Every other parameter is uniform over the box. eddington_cap = 1 is the cutoff of the Eddington-limit check in Kiwi-GA (Brands et al. 2022, A&A, 663, A36); here it is applied to Gamma_e computed with the Thomson opacity above, so it rejects every star above the Eddington limit."
+    "_note": "Distribution of true parameters for simulated spectra of realistic stars. It is the 'lmc' informative prior (abundances, helium, mass bounds, v_inf relations) with the Bjorklund mass-loss relation switched on, the rotation distribution above for vsini, Gamma_e (electron scattering, Thomson opacity) capped at eddington_cap, and the ZAMS lower limit on luminosity in 'zams'. Every other parameter is uniform over the box. eddington_cap = 1 is the cutoff of the Eddington-limit check in Kiwi-GA (Brands et al. 2022, A&A, 663, A36); here it is applied to Gamma_e computed with the Thomson opacity above, so it rejects every star above the Eddington limit."
   }
 }

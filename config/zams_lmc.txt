@@ -1,0 +1,34 @@
+# ZAMS of non-rotating LMC models: the first model (age 0) of each
+# evolutionary track of Brott et al. (2011, A&A 530, A115; 5-60 Msun) and
+# Koehler et al. (2015, A&A 573, A71; 80-500 Msun), from their CDS catalogues
+# (https://cdsarc.cds.unistra.fr/ftp/J/A+A/530/A115/evol/ and
+# https://cdsarc.cds.unistra.fr/ftp/J/A+A/573/A71/tracks/).
+# columns: initial mass [Msun], Teff [K], log L [Lsun], R [Rsun], log g [cgs], source file
+
+   8    24471.4  3.45816    2.9793  4.39257  Brott+2011 J/A+A/530/A115 evol/f8-0.lmc.track.dat
+   9    25877.6  3.62131    3.2149  4.37763  Brott+2011 J/A+A/530/A115 evol/f9-0.lmc.track.dat
+  10    27294.5  3.76190    3.3975  4.37541  Brott+2011 J/A+A/530/A115 evol/f10-0.lmc.track.dat
+  12    29652.3  4.00220    3.7961  4.35822  Brott+2011 J/A+A/530/A115 evol/f12-0.lmc.track.dat
+  13    30700.1  4.10459    3.9845  4.35090  Brott+2011 J/A+A/530/A115 evol/f13-0.lmc.track.dat
+  15    32609.8  4.28456    4.3445  4.33790  Brott+2011 J/A+A/530/A115 evol/f15-0.lmc.track.dat
+  16    33492.3  4.36323    4.5090  4.33364  Brott+2011 J/A+A/530/A115 evol/f16-0.lmc.track.dat
+  19    35907.9  4.56573    4.9526  4.32673  Brott+2011 J/A+A/530/A115 evol/f19-0.lmc.track.dat
+  20    36628.7  4.62530    5.0975  4.32394  Brott+2011 J/A+A/530/A115 evol/f20-0.lmc.track.dat
+  25    39585.4  4.87407    5.8119  4.30685  Brott+2011 J/A+A/530/A115 evol/f25-0.lmc.track.dat
+  30    42054.4  5.06385    6.4070  4.30132  Brott+2011 J/A+A/530/A115 evol/f30-0.lmc.track.dat
+  35    43978.1  5.21913    7.0056  4.29058  Brott+2011 J/A+A/530/A115 evol/f35-0.lmc.track.dat
+  39    45324.9  5.32225    7.4269  4.28682  Brott+2011 J/A+A/530/A115 evol/f39-0.lmc.track.dat
+  40    45580.4  5.34708    7.5568  4.28270  Brott+2011 J/A+A/530/A115 evol/f40-0.lmc.track.dat
+  45    46998.0  5.45468    8.0451  4.27944  Brott+2011 J/A+A/530/A115 evol/f45-0.lmc.track.dat
+  50    48176.1  5.54838    8.5286  4.27446  Brott+2011 J/A+A/530/A115 evol/f50-0.lmc.track.dat
+  60    50023.1  5.70437    9.4667  4.26287  Brott+2011 J/A+A/530/A115 evol/f60-0.lmc.track.dat
+  80    52619.5  5.93429   11.1482  4.24569  Kohler+2015 J/A+A/573/A71 tracks/f80-0.lmc.track.dat
+ 100    54098.9  6.10223   12.7965  4.22253  Kohler+2015 J/A+A/573/A71 tracks/f100-0.lmc.track.dat
+ 125    55429.0  6.25924   14.6049  4.20469  Kohler+2015 J/A+A/573/A71 tracks/f125-0.lmc.track.dat
+ 150    56029.7  6.38239   16.4708  4.17931  Kohler+2015 J/A+A/573/A71 tracks/f150-0.lmc.track.dat
+ 175    56222.4  6.48285   18.3637  4.15163  Kohler+2015 J/A+A/573/A71 tracks/f175-0.lmc.track.dat
+ 200    56210.7  6.56704   20.2412  4.12502  Kohler+2015 J/A+A/573/A71 tracks/f200-0.lmc.track.dat
+ 230    55865.2  6.65318   22.6287  4.08871  Kohler+2015 J/A+A/573/A71 tracks/f230-0.lmc.track.dat
+ 260    55457.9  6.72665   24.9892  4.05578  Kohler+2015 J/A+A/573/A71 tracks/f260-0.lmc.track.dat
+ 300    54548.6  6.81089   28.4598  4.00469  Kohler+2015 J/A+A/573/A71 tracks/f300-0.lmc.track.dat
+
