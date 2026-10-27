@@ -81,8 +81,8 @@
     "mass_loss": {
       "use": false,
       "centre": 0.0,
-      "width": 0.4,
-      "_note": "Gaussian on log mdot minus the Bjorklund, Sundqvist, Singh, Puls & Najarro (2023, A&A 676, A109) recipe, which has the metallicity dependence built in. Off by default: the sampled parameter box extends well outside the recipe's calibrated range, so whether this relation helps or hurts recovery is still an open question. Override with informative_prior(..., use_mass_loss=True). centre is the expected offset of log mdot from the recipe and width the scatter around it, both in dex; centre = 0 is a placeholder, not a value checked against LMC stars. The accuracy of the recipe itself is 0.18 dex: Bjorklund et al. (2023) find almost 90% of their grid models within a factor of 2 (0.30 dex) of the fitting formula, which for a Gaussian is a standard deviation of 0.30 / 1.645 = 0.18 dex. width = 0.4 dex widens this to allow for real stars lying further from the models than the grid does."
+      "width": 0.18,
+      "_note": "Gaussian on log mdot minus the Bjorklund, Sundqvist, Singh, Puls & Najarro (2023, A&A 676, A109) recipe, which has the metallicity dependence built in. Off by default: the sampled parameter box extends well outside the recipe's calibrated range, so whether this relation helps or hurts recovery is still an open question. Override with informative_prior(..., use_mass_loss=True). centre is the expected offset of log mdot from the recipe and width the scatter around it, both in dex; centre = 0 is a placeholder, not a value checked against LMC stars. width = 0.18 dex is the accuracy of the recipe itself: Bjorklund et al. (2023) find almost 90% of their grid models within a factor of 2 (0.30 dex) of the fitting formula, which for a Gaussian is a standard deviation of 0.30 / 1.645 = 0.18 dex. It does not include how far real stars may lie from the models."
     }
   },
   "realistic_truths": {
