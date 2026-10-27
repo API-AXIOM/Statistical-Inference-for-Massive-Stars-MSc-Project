@@ -4,6 +4,8 @@
   ``build_multi_instrument_grid``, from ``config/instruments.json``.
 * Observations: ``load_observation`` reads a spectrum from .fits, .npz or a
   text file; ``make_mock_observation`` simulates one from the model.
+* Line windows: ``read_line_windows`` reads the fitting window of each line
+  from a Kiwi-GA ``line_list.txt``.
 * Results: ``save_results`` writes ``results.npz``; ``prior_boundary_report``,
   ``format_parameter_table`` and ``format_provenance`` build the text of
   ``summary.txt``.
@@ -471,6 +473,38 @@ def load_observation(path, extension=None, wavelength_column=None,
         "flux": flux,
         "error": error,
     }
+
+
+def read_line_windows(path):
+    """Read the fitting window of each line from a Kiwi-GA ``line_list.txt``.
+
+    Each non-empty line not starting with ``#`` holds the line name, its
+    resolving power, and the low and high edge of its window in Angstrom,
+    followed by columns that are not used here. The names must be the
+    emulators' line names (as ``inspect_spectrum.py`` lists them).
+
+    Returns a dictionary from line name to ``(low, high)``, in file order.
+    """
+    windows = {}
+    with open(path) as handle:
+        for number, text in enumerate(handle, start=1):
+            columns = text.split()
+            if not columns or columns[0].startswith("#"):
+                continue
+            if len(columns) < 4:
+                raise ValueError(f"{path}, line {number}: expected a name, a "
+                                 f"resolving power and two window edges")
+            name = columns[0]
+            low, high = float(columns[2]), float(columns[3])
+            if not low < high:
+                raise ValueError(f"{path}, line {number}: the window of "
+                                 f"{name} has low edge {low} >= high edge {high}")
+            if name in windows:
+                raise ValueError(f"{path}, line {number}: {name} is listed twice")
+            windows[name] = (low, high)
+    if not windows:
+        raise ValueError(f"{path} lists no line windows")
+    return windows
 
 
 def save_results(path, results):

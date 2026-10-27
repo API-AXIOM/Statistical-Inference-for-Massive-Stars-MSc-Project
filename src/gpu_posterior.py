@@ -14,7 +14,8 @@ The statistical model is:
 * a Gaussian term on a broadband magnitude, with a configurable uncertainty.
 
 Each observed wavelength belongs to at most one line window: the windows in
-``gpu_config.LINE_WINDOW_OVERRIDES`` do not overlap, and each is taken as
+``gpu_config.LINE_WINDOW_OVERRIDES`` (or those given as ``line_windows``) do
+not overlap, and each is taken as
 ``low <= wavelength < high`` so neighbouring windows can share an edge. Every
 covered wavelength therefore contributes exactly one residual. Building a
 posterior from windows that do overlap raises an error.
@@ -89,7 +90,7 @@ class GPUPosterior:
                  magnitude_uncertainty=0.1, device=None, dtype=torch.float32,
                  use_magnitude=True, filter_directory=None, min_line_points=8,
                  flux_uncertainty=None, prior=None, extinction=0.0,
-                 verbose=True):
+                 line_windows=None, verbose=True):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.dtype = dtype
         self.resolution = resolution if isinstance(resolution, list) else float(resolution)
@@ -115,7 +116,7 @@ class GPUPosterior:
         skipped = {}
         for name, emulator in line_emulators.items():
             # Positions of the observed points inside this line's window.
-            low, high = line_window(name, emulator)
+            low, high = line_window(name, emulator, line_windows)
             window = np.flatnonzero((observed_wavelength >= low)
                                     & (observed_wavelength < high))
             # Leave the line out unless its whole window is evenly covered.
@@ -164,7 +165,8 @@ class GPUPosterior:
             raise ValueError(
                 f"line windows overlap: {int((counts > 1).sum())} observed "
                 f"point(s) fall in more than one of {pairs}. Edit "
-                f"LINE_WINDOW_OVERRIDES in gpu_config.py so the windows "
+                f"LINE_WINDOW_OVERRIDES in gpu_config.py (or the file given "
+                f"with --line-windows) so the windows "
                 f"meet without overlapping.")
         self.covered_indices = covered
         self.n_covered_points = int(covered.size)

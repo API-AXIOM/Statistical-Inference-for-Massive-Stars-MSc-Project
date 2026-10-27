@@ -98,8 +98,16 @@ INSTRUMENT_NSIG = 4.0
 MACRO_EXTENT = 3.0
 
 
-def line_window(name, emulator):
-    """Wavelength window used for fitting one line."""
+def line_window(name, emulator, windows=None):
+    """Wavelength window used for fitting one line.
+
+    ``windows`` optionally maps line names to ``(low, high)`` in Angstrom for
+    one fit (see ``data_io.read_line_windows``); a line it lists uses that
+    window instead of the one in ``LINE_WINDOW_OVERRIDES`` or the emulator's
+    own range.
+    """
+    if windows and name in windows:
+        return windows[name]
     if name in LINE_WINDOW_OVERRIDES:
         return LINE_WINDOW_OVERRIDES[name]
     return tuple(float(x) for x in emulator.lambda_range)

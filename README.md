@@ -255,6 +255,16 @@ sampling, or that the spectrum covers only in part, is left out, and the fit
 says which lines and why. `inspect_spectrum.py` applies the same check and
 lists these lines before you fit.
 
+Each line's window is set in `LINE_WINDOW_OVERRIDES` (`src/gpu_config.py`),
+or is the emulator's own range for a line not listed there. To fit with other
+windows, for example those of a spectrum cut to its own line windows, list
+them in a Kiwi-GA style `line_list.txt` (one line per window: the emulator's
+line name, a resolving power, and the low and high edge in Angstrom; further
+columns are ignored) and pass it with `--line-windows <file>`. The fit then
+uses only the lines in that file, unless `--lines` names others. The resolving
+powers in the file are not used; they come from `--instrument`.
+`inspect_spectrum.py --line-windows <file>` checks those windows instead.
+
 ## Photometry
 
 Filter files live in `emulators/filter_transmissions/` (or pass another
@@ -484,8 +494,8 @@ environment loaded.
   whose window spans a gap, the join between two spectrograph arms, a change
   of sampling, or the end of the spectrum is not fitted. `inspect_spectrum.py`
   lists such lines. To include one, adjust its window in
-  `LINE_WINDOW_OVERRIDES` (`src/gpu_config.py`) so it lies within evenly
-  sampled data, or resample the spectrum onto an even grid.
+  `LINE_WINDOW_OVERRIDES` (`src/gpu_config.py`) or with `--line-windows` so it
+  lies within evenly sampled data, or resample the spectrum onto an even grid.
 * **Metallicity.** The emulators were trained at LMC metallicity, so every star
   is fitted as an LMC star.
 * **Informative priors.** The informative priors and relations have not been

@@ -117,8 +117,11 @@ def plot_posterior_predictive(results, posterior, path, n_draws=100):
     n_panels = len(order)
     n_columns = 3
     n_rows = int(np.ceil(n_panels / n_columns))
+    # Constrained layout reserves space for the suptitle, so it never sits
+    # on top of the first row of panels.
     figure, axes = plt.subplots(n_rows, n_columns,
-                                figsize=(5 * n_columns, 2.6 * n_rows))
+                                figsize=(5 * n_columns, 2.6 * n_rows),
+                                layout="constrained")
     axes = np.atleast_1d(axes).ravel()
 
     for panel, line_index in enumerate(order):
@@ -140,7 +143,6 @@ def plot_posterior_predictive(results, posterior, path, n_draws=100):
     axes[0].legend(fontsize=7)
     figure.suptitle("posterior predictive (blue: draws from the posterior, "
                     "with the observation noise the fit assumed)")
-    figure.tight_layout()
     figure.savefig(path, dpi=300)
     plt.close(figure)
 

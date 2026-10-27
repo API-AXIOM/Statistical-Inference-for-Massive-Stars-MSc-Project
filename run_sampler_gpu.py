@@ -98,6 +98,13 @@ def parse_arguments(argv=None):
                       help="restrict the fit to these line names, as "
                            "inspect_spectrum.py lists them (default: every "
                            "line the data covers)")
+    data.add_argument("--line-windows", default=None, metavar="LINE_LIST",
+                      help="fit each line over the window given in this "
+                           "Kiwi-GA line_list.txt (name, resolving power, "
+                           "low and high edge in Angstrom) instead of its "
+                           "standard window; without --lines, only the lines "
+                           "it lists are fitted. Its resolving powers are not "
+                           "used: those come from --instrument")
     data.add_argument("--snr", type=float, default=100.0,
                       help="signal-to-noise per pixel: the fit assumes a flux "
                            "uncertainty of 1/SNR at every point (unless "
@@ -686,11 +693,26 @@ def main(argv=None):
     print(f"[data] instrument '{', '.join(arguments.instrument)}': {description}")
     print(f"[data] resolution {data_io.format_resolution(resolution)}")
 
+    line_windows = None
+    if arguments.line_windows:
+        line_windows = data_io.read_line_windows(arguments.line_windows)
+        if arguments.lines is None:
+            arguments.lines = list(line_windows)
+        print(f"[data] line windows from {arguments.line_windows}: "
+              + ", ".join(f"{name} {low:g}-{high:g}"
+                          for name, (low, high) in line_windows.items()))
+
     print("[setup] loading emulator checkpoints ...")
     load_start = time.perf_counter()
     line_emulators, sed_emulator = load_emulators(
         load_sed=not arguments.no_magnitude,
         only_lines=arguments.lines)
+    if line_windows:
+        unused = [name for name in line_windows if name not in line_emulators]
+        if unused:
+            print(f"[data] WARNING {arguments.line_windows} lists windows for "
+                  f"lines that are not fitted, so they are not used: "
+                  f"{', '.join(unused)}")
     print(f"[setup] {len(line_emulators)} line emulators loaded in "
           f"{time.perf_counter() - load_start:.1f} s")
 
@@ -782,6 +804,7 @@ def main(argv=None):
         flux_uncertainty=flux_uncertainty,
         prior=prior,
         extinction=arguments.extinction,
+        line_windows=line_windows,
     )
     print(f"[setup] posterior ready in {time.perf_counter() - build_start:.1f} s")
 

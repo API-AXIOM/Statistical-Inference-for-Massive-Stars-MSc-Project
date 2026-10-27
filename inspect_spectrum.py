@@ -83,7 +83,8 @@ def describe_fits(path):
             print()
 
 
-def summarise(wavelength, flux, label, snr_window=None, lines=None):
+def summarise(wavelength, flux, label, snr_window=None, lines=None,
+              windows=None):
     """Print the ranges, sampling, normalisation state, and estimated S/N."""
     print(f"=== {label} ===")
     print(f"  points          : {wavelength.size}")
@@ -98,7 +99,7 @@ def summarise(wavelength, flux, label, snr_window=None, lines=None):
 
     for name, emulator in lines.items():
         try: 
-            low, high = line_window(name, emulator)
+            low, high = line_window(name, emulator, windows)
             mask = (wavelength >= low) & (wavelength < high)
             wl_line = wavelength[mask]
             if mask.sum() < 3:
@@ -269,7 +270,7 @@ def summarise(wavelength, flux, label, snr_window=None, lines=None):
 
     print()
 
-def coverage_report(wavelength, lines=None):
+def coverage_report(wavelength, lines=None, windows=None):
     """Which line windows the fit will use, where they lie, and why any
     others are left out (the same check the fit applies)."""
     from gpu_config import line_window
@@ -278,7 +279,7 @@ def coverage_report(wavelength, lines=None):
     print("=== line windows covered ===")
     used, left_out, total = [], [], np.zeros(wavelength.size, dtype=int)
     for name, emulator in lines.items():
-        low, high = line_window(name, emulator)
+        low, high = line_window(name, emulator, windows)
         mask = (wavelength >= low) & (wavelength < high)
         problem, _ = check_window(wavelength[mask], low, high)
         if problem:
@@ -322,6 +323,10 @@ def main(argv=None):
                         help="line-free wavelength interval for a robust per-pixel S/N estimate",)
     parser.add_argument("--plot", default=None, help="write a PNG of the spectrum")
     parser.add_argument("--no-coverage", action="store_true")
+    parser.add_argument("--line-windows", default=None, metavar="LINE_LIST",
+                        help="check the windows in this Kiwi-GA line_list.txt "
+                             "instead of the standard ones, and only the lines "
+                             "it lists (as run_sampler_gpu.py --line-windows)")
     parser.add_argument("--header", type=int, default=None,
                         metavar="EXT",
                         help="print every header card of this FITS extension")
@@ -348,17 +353,21 @@ def main(argv=None):
               "structure printed above.")
         return 1
     from emulators import load_emulators
+    windows = (data_io.read_line_windows(arguments.line_windows)
+               if arguments.line_windows else None)
     try:
-        lines, _ = load_emulators(load_sed=False)
+        lines, _ = load_emulators(load_sed=False,
+                                  only_lines=list(windows) if windows else None)
     except Exception as error:
         lines = {}
         print(f"Could not load lines {error}")
         print("Coverage report cannot be made.")
     summarise(observation["wavelength"], observation["flux"],
-              "what the pipeline would read", snr_window=arguments.snr_window, lines=lines)
+              "what the pipeline would read", snr_window=arguments.snr_window, lines=lines,
+              windows=windows)
 
     if not arguments.no_coverage and len(lines) > 0:
-        coverage_report(observation["wavelength"], lines=lines)
+        coverage_report(observation["wavelength"], lines=lines, windows=windows)
 
     if arguments.plot:
         import matplotlib
