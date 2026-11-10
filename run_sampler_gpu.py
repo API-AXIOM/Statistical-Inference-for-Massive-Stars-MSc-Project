@@ -247,8 +247,7 @@ def parse_arguments(argv=None):
                         help="walkers the population sampler advances "
                              "together; sets the GPU batch, not the statistics")
     nested.add_argument("--ns-max-calls", type=int, default=None,
-                        help="stop after this many likelihood calls (for "
-                             "timing tests; the posterior is then not trustworthy)")
+                        help="stop after this many likelihood calls. No posterior is written when the call cap is reached.")
 
     runtime = parser.add_argument_group("runtime")
     runtime.add_argument("--device", default=None, help="cuda, cuda:0, cpu ...")
@@ -420,19 +419,23 @@ def fit_nested(arguments, posterior, rng, true_parameters, observation):
           f"sampler, {arguments.ns_steps} steps, {arguments.ns_walkersize} "
           f"walkers, {arguments.ns_direction} directions; "
           f"checkpoints in {log_dir}")
-    result = samplers.run_nested(
-        posterior, rng, n_live=arguments.n_live, log_dir=log_dir,
-        max_calls=arguments.ns_max_calls,
-        use_cuda_graph=(not arguments.no_cuda_graph
-                        and posterior.device.type == "cuda"),
-        step_sampler_steps=arguments.ns_steps,
-        step_method=arguments.ns_method,
-        step_scale=arguments.ns_scale,
-        walk_adapt_factor=arguments.ns_walk_adapt,
-        step_direction=arguments.ns_direction,
-        walkersize=arguments.ns_walkersize, posterior_only=True,
-        progress=False, verbose=True,
-        resume="resume-similar" if arguments.resume else "overwrite")
+    try:
+        result = samplers.run_nested(
+            posterior, rng, n_live=arguments.n_live, log_dir=log_dir,
+            max_calls=arguments.ns_max_calls,
+            use_cuda_graph=(not arguments.no_cuda_graph
+                            and posterior.device.type == "cuda"),
+            step_sampler_steps=arguments.ns_steps,
+            step_method=arguments.ns_method,
+            step_scale=arguments.ns_scale,
+            walk_adapt_factor=arguments.ns_walk_adapt,
+            step_direction=arguments.ns_direction,
+            walkersize=arguments.ns_walkersize, posterior_only=True,
+            progress=False, verbose=True,
+            resume="resume-similar" if arguments.resume else "overwrite")
+    except samplers.CallCapReached as error:
+        raise SystemExit(f"[nested] Reached max {error}. No posterior or outputs were written. "
+                         "Continue the run with --resume and a larger --ns-max-calls.") from None
 
     flat_samples = result["flat_samples"]
     capped = (arguments.ns_max_calls is not None

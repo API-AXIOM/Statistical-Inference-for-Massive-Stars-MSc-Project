@@ -81,6 +81,10 @@ STEP_DIRECTIONS = {
 STEP_METHODS = ("slice", "randomwalk")
 
 
+class CallCapReached(Exception):
+    """Raised from the likelihood when a nested-sampling run uses up its call cap."""
+
+
 def run_nested(posterior, rng, n_live=600, log_dir=None, max_calls=None,
                use_cuda_graph=False, batch_size=16384,
                graph_sizes=NESTED_GRAPH_SIZES, step_sampler_steps=None,
@@ -199,6 +203,8 @@ def run_nested(posterior, rng, n_live=600, log_dir=None, max_calls=None,
 
     def log_likelihood(theta):
         theta = np.atleast_2d(theta)
+        if max_calls is not None and not benchmark and counter["calls"] + theta.shape[0] > max_calls:
+            raise CallCapReached(f"{counter['calls']:,} likelihood calls, cap {max_calls:,}")
         counter["calls"] += theta.shape[0]
         counter["batches"] += 1
         if verbose and time.perf_counter() - counter["reported"] > 30.0:
